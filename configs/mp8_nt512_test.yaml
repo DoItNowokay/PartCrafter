@@ -1,0 +1,45 @@
+# Test Configuration for PartCrafter
+
+model:
+  pretrained_model_name_or_path: 'pretrained_weights/TripoSG'
+  vae:
+    num_tokens: 512
+  transformer:
+    enable_local_cross_attn: true
+    global_attn_block_ids: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+    global_attn_block_id_range: null
+
+dataset:
+  config:
+    # Modify this path to point to your test dataset configuration
+    - "preprocessed_data/objaverse/hf-objaverse-v1/glbs/object_part_configs.json"
+  # Specify the 'test' split for evaluation
+  split: "test" 
+  min_num_parts: 1
+  max_num_parts: 8
+  training_ratio: 0.9
+  max_iou_mean: 0.5
+  max_iou_max: 0.5
+  shuffle_parts: true
+  object_ratio: 0.3
+  rotating_ratio: 0.2
+  ratating_degree: 10
+
+test:
+  batch_size_per_gpu: 1
+  nrow: 4
+  min_num_parts: 2
+  max_num_parts: 8
+  num_inference_steps: 50
+  max_num_expanded_coords: 1e8
+  use_flash_decoder: false
+  rendering:
+    radius: 4.0
+    num_views: 36
+    fps: 18
+  metric:
+    cd_num_samples: 2048
+    cd_metric: "l2"
+    f1_score_threshold: 0.1
+    default_cd: 1e6
+    default_f1: 0.0
