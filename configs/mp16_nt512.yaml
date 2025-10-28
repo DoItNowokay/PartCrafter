@@ -35,7 +35,7 @@ lr_scheduler:
   num_warmup_steps: 1000
 
 train:
-  batch_size_per_gpu: 32
+  batch_size_per_gpu: 16
   epochs: 10
   grad_checkpoint: true
   weighting_scheme: "logit_normal"
@@ -56,6 +56,7 @@ train:
     use_ema_warmup: true
     inv_gamma: 1.
     power: 0.75
+  # trainable_modules: "blocks.18.,blocks.19.,blocks.20.,blocks.21."
 
 val:
   batch_size_per_gpu: 1

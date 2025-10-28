@@ -4,6 +4,8 @@ import numpy as np
 import argparse
 import json
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from src.utils.data_utils import scene_to_parts, mesh_to_surface, normalize_mesh
 
 if __name__ == '__main__':

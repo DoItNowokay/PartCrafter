@@ -6,11 +6,13 @@ model:
     enable_local_cross_attn: true
     global_attn_block_ids: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
     global_attn_block_id_range: null # The average should be 10 for unet-skipping
-
+  text_encoder_name: "openai/clip-vit-large-patch14"
 
 dataset:
   config: 
-    - 'datasets/object_part_configs.json' # Modify this path if you use your own dataset
+    # - 'datasets/object_part_configs.json' # Modify this path if you use your own dataset
+    - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/object_part_configs.json'
+  caps3d_csv_path: 'preprocessed_data/Caps3D.csv'
   training_ratio: 0.9
   min_num_parts: 1
   max_num_parts: 8
@@ -35,7 +37,7 @@ lr_scheduler:
   num_warmup_steps: 1000
 
 train:
-  batch_size_per_gpu: 32
+  batch_size_per_gpu: 8
   epochs: 10
   grad_checkpoint: true
   weighting_scheme: "logit_normal"
@@ -56,6 +58,11 @@ train:
     use_ema_warmup: true
     inv_gamma: 1.
     power: 0.75
+  # trainable_modules: "blocks.12.,blocks.13.,blocks.14.,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20."
+  # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.17.,blocks.18.,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
+  # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
+  # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.13.,blocks.14.,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
+  # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.9.,blocks.10.,blocks.11.,blocks.12.,blocks.13.,blocks.14.,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
 
 val:
   batch_size_per_gpu: 1

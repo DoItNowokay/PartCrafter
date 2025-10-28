@@ -6,6 +6,8 @@ import json
 import torch
 from huggingface_hub import snapshot_download
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from src.utils.image_utils import prepare_image
 from src.models.briarmbg import BriaRMBG
 
