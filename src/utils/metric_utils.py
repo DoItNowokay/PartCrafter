@@ -4,6 +4,12 @@ import trimesh
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
+import torch
+
+from extensions.chamfer_dist import ChamferDistanceL2
+from pytorch3d.structures import Meshes
+from pytorch3d.ops import sample_points_from_meshes, knn_points
+
 def sample_from_mesh(
     mesh: trimesh.Trimesh,
     num_samples: Optional[int] = 10000,
@@ -82,12 +88,53 @@ def compute_cd_and_f_score(
     threshold: float = 0.1,
     metric: str = 'l2'
 ):
-    min_1_to_2, min_2_to_1 = compute_mutual_nearest_distance_for_meshes(mesh1, mesh2, num_samples, metric=metric)
-    chamfer_dist = np.mean(min_2_to_1) + np.mean(min_1_to_2)
-    precision_1 = np.mean((min_1_to_2 < threshold).astype(np.float32))
-    precision_2 = np.mean((min_2_to_1 < threshold).astype(np.float32))
-    fscore = 2 * precision_1 * precision_2 / (precision_1 + precision_2)
+    # min_1_to_2, min_2_to_1 = compute_mutual_nearest_distance_for_meshes(mesh1, mesh2, num_samples, metric=metric)
+    # chamfer_dist = np.mean(min_2_to_1) + np.mean(min_1_to_2)
+    print(11)
+    chamfer_dist = ChamferDistanceL2().cuda()(torch.tensor(mesh1, device='cuda').unsqueeze(0), torch.tensor(mesh2.vertices, device='cuda').unsqueeze(0)).item()
+    print(12)
+    # precision_1 = np.mean((min_1_to_2 < threshold).astype(np.float32))
+    # precision_2 = np.mean((min_2_to_1 < threshold).astype(np.float32))
+    # fscore = 2 * precision_1 * precision_2 / (precision_1 + precision_2)
+    fscore = 0.0
     return chamfer_dist, fscore
+
+def compute_cd_and_f_score_cuda(
+    gt_points: torch.Tensor,
+    pred_mesh: trimesh.Trimesh,
+    num_samples: int = 204800,
+    threshold: float = 0.1,
+):
+    device = gt_points.device
+    # if pred_verts.device != device or pred_faces.device != device:
+    #     raise ValueError("All input tensors must be on the same CUDA device.")
+
+    if gt_points.shape[-1] > 3:
+        gt_points = gt_points[:, :3]
+    if gt_points.shape[0] < num_samples:
+        gt_sampled_points = gt_points
+    else:
+        perm = torch.randperm(gt_points.shape[0], device=device)
+        idx = perm[:num_samples]
+        gt_sampled_points = gt_points[idx]
+        
+    gt_sampled_points = gt_sampled_points.unsqueeze(0)
+
+    pred_sampled_points = sample_from_mesh(pred_mesh, num_samples)
+    pred_sampled_points = torch.from_numpy(pred_sampled_points).float().to(device).unsqueeze(0)
+    knn_gt_to_pred = knn_points(gt_sampled_points, pred_sampled_points, K=1)
+    dists_gt_to_pred = torch.sqrt(knn_gt_to_pred.dists.squeeze(-1))
+    
+    knn_pred_to_gt = knn_points(pred_sampled_points, gt_sampled_points, K=1)
+    dists_pred_to_gt = torch.sqrt(knn_pred_to_gt.dists.squeeze(-1))
+
+    chamfer_dist = torch.mean(dists_gt_to_pred) + torch.mean(dists_pred_to_gt)
+
+    precision = torch.mean((dists_gt_to_pred < threshold).float())
+    recall = torch.mean((dists_pred_to_gt < threshold).float())
+    fscore = 2 * precision * recall / (precision + recall + 1e-8) 
+
+    return chamfer_dist.item(), fscore.item()
 
 def compute_cd_and_f_score_in_training(
     gt_surface: np.ndarray,
