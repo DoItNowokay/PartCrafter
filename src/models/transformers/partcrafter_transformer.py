@@ -446,7 +446,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 global_attn_block_ids = list(range(global_attn_block_id_range[0], global_attn_block_id_range[1] + 1))
         self.global_attn_block_ids = global_attn_block_ids
 
-        self.text_embed_proj = torch.nn.Linear(768, self.cross_attention_dim)
+        # self.text_embed_proj = torch.nn.Linear(768, self.cross_attention_dim)
 
         if len(global_attn_block_ids) > 0:
             # Override self-attention processors for global attention blocks
@@ -670,8 +670,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
 
         hidden_states = self.proj_in(hidden_states)
-        if encoder_hidden_states is not None:
-            encoder_hidden_states = self.text_embed_proj(encoder_hidden_states)
+        # if encoder_hidden_states is not None:
+        #     encoder_hidden_states = self.text_embed_proj(encoder_hidden_states)
 
         # T + 1 token
         hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)

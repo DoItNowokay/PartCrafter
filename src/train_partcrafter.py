@@ -45,8 +45,8 @@ from src.models.transformers import PartCrafterDiTModel
 from src.pipelines.pipeline_partcrafter import PartCrafterPipeline
 
 from src.datasets import (
-    # ObjaversePartDataset, # No longer needed
-    # BatchedObjaversePartDataset, # No longer needed
+    ObjaversePartDataset,
+    BatchedObjaversePartDataset,
     ObjaverseCaptionDataset,
     BatchedObjaverseCaptionDataset,
     MultiEpochsDataLoader,
@@ -216,6 +216,18 @@ def main():
         default=-1,
         help="Iteration of the pretrained PartCrafterDiTModel checkpoint"
     )
+    parser.add_argument(
+        "--text_conditioning",
+        type=bool,
+        default=False,
+        help="Whether to use text conditioning for training"
+    )
+    parser.add_argument(
+        "--editing",
+        type=bool,
+        default=False,
+        help="Whether to perform editing"
+    )
 
     # Parse the arguments
     args, extras = parser.parse_known_args()
@@ -286,17 +298,30 @@ def main():
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    train_dataset = BatchedObjaverseCaptionDataset(
-        configs=configs,
-        batch_size=configs["train"]["batch_size_per_gpu"],
-        is_main_process=accelerator.is_main_process,
-        shuffle=True,
-        training=True,
-    )
-    val_dataset = ObjaverseCaptionDataset(
-        configs=configs,
-        training=False,
-    )
+    if args.text_conditioning:
+        train_dataset = BatchedObjaverseCaptionDataset(
+            configs=configs,
+            batch_size=configs["train"]["batch_size_per_gpu"],
+            is_main_process=accelerator.is_main_process,
+            shuffle=True,
+            training=True,
+        )
+        val_dataset = ObjaverseCaptionDataset(
+            configs=configs,
+            training=False,
+        )
+    else: # fallback to default (image conditioned training)
+        train_dataset = BatchedObjaversePartDataset(
+            configs=configs,
+            batch_size=configs["train"]["batch_size_per_gpu"],
+            is_main_process=accelerator.is_main_process,
+            shuffle=True,
+            training=True,
+        )
+        val_dataset = ObjaversePartDataset(
+            configs=configs,
+            training=False,
+        )
     train_loader = MultiEpochsDataLoader(
         train_dataset,
         batch_size=configs["train"]["batch_size_per_gpu"],
@@ -347,12 +372,13 @@ def main():
     )
 
     # --- CORRECTED PART 1: Initialize both tokenizer and text_encoder ---
-    tokenizer = CLIPTokenizer.from_pretrained(
-        configs["model"]["text_encoder_name"]
-    )
-    text_encoder = CLIPTextModel.from_pretrained(
-        configs["model"]["text_encoder_name"]
-    )
+    if args.text_conditioning:
+        tokenizer = CLIPTokenizer.from_pretrained(
+            configs["model"]["text_encoder_name"]
+        )
+        text_encoder = CLIPTextModel.from_pretrained(
+            configs["model"]["text_encoder_name"]
+        )
 
     enable_part_embedding = configs["model"]["transformer"].get("enable_part_embedding", True)
     enable_local_cross_attn = configs["model"]["transformer"].get("enable_local_cross_attn", True)
@@ -430,10 +456,10 @@ def main():
     # Freeze VAE and image encoder
     vae.requires_grad_(False)
     image_encoder_dinov2.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    if args.text_conditioning: text_encoder.requires_grad_(False)
     vae.eval()
     image_encoder_dinov2.eval()
-    text_encoder.eval()
+    if args.text_conditioning: text_encoder.eval()
 
     trainable_modules = configs["train"].get("trainable_modules", None)
     if trainable_modules is None:
@@ -444,7 +470,6 @@ def main():
         for name, module in transformer.named_modules():
             for module_name in tuple(trainable_modules.split(",")):
                 if module_name in name:
-                    print(name)
                     for params in module.parameters():
                         params.requires_grad = True
                     trainable_module_names.append(name)
@@ -530,7 +555,7 @@ def main():
 
     vae.to(accelerator.device, dtype=weight_dtype)
     image_encoder_dinov2.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    if args.text_conditioning: text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     updated_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     total_updated_steps = configs["lr_scheduler"]["total_steps"]
@@ -624,28 +649,29 @@ def main():
                 image_embeds = image_encoder_dinov2(images).last_hidden_state
             negative_image_embeds = torch.zeros_like(image_embeds)
 
-            texts = batch["captions"]
             # --- CORRECTED PART 2: Use the initialized tokenizer instance ---
-            with torch.no_grad():
-                text_inputs = tokenizer(
-                    texts,
-                    padding="max_length",
-                    max_length=tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
-                text_embeds = text_encoder(**text_inputs).last_hidden_state
+            if args.text_conditioning: 
+                texts = batch["captions"]
+                with torch.no_grad():
+                    text_inputs = tokenizer(
+                        texts,
+                        padding="max_length",
+                        max_length=tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
+                    text_embeds = text_encoder(**text_inputs).last_hidden_state
 
-                uncond_input = tokenizer(
-                    [""] * len(texts),
-                    padding="max_length",
-                    max_length=tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                uncond_input = {k: v.to(accelerator.device) for k, v in uncond_input.items()}
-                negative_text_embeds = text_encoder(**uncond_input).last_hidden_state
+                    uncond_input = tokenizer(
+                        [""] * len(texts),
+                        padding="max_length",
+                        max_length=tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    uncond_input = {k: v.to(accelerator.device) for k, v in uncond_input.items()}
+                    negative_text_embeds = text_encoder(**uncond_input).last_hidden_state
 
             part_surfaces = batch["part_surfaces"]
             part_surfaces = part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
@@ -674,20 +700,21 @@ def main():
             sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
             latent_model_input = noisy_latents = (1. - sigmas) * latents + sigmas * noise
             
-            text_embeds = text_embeds.repeat_interleave(num_parts, dim=0)
-            negative_text_embeds = negative_text_embeds.repeat_interleave(num_parts, dim=0)
+            if args.text_conditioning:
+                text_embeds = text_embeds.repeat_interleave(num_parts, dim=0)
+                negative_text_embeds = negative_text_embeds.repeat_interleave(num_parts, dim=0)
 
             if configs["train"]["cfg_dropout_prob"] > 0:
                 dropout_mask = torch.rand(num_objects, device=accelerator.device) < configs["train"]["cfg_dropout_prob"]
                 dropout_mask = dropout_mask.repeat_interleave(num_parts)
                 if dropout_mask.any():
                     image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
-                    text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
+                    if args.text_conditioning: text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
 
             model_pred = transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
-                encoder_hidden_states=text_embeds, # Pass text embeddings here
+                encoder_hidden_states=image_embeds if args.text_conditioning == False else text_embeds,
                 attention_kwargs={"num_parts": num_parts}
             ).sample
 
@@ -697,6 +724,13 @@ def main():
             elif configs["train"]["training_objective"] == 'v':
                 target = noise - latents
             elif configs["train"]["training_objective"] == '-v':
+                # The training objective for TripoSG is the reverse of the flow matching objective. 
+                # It uses "different directions", i.e., the negative velocity. 
+                # This is probably a mistake in engineering, not very harmful. 
+                # In TripoSG's rectified flow scheduler, prev_sample = sample + (sigma - sigma_next) * model_output
+                # See TripoSG's scheduler https://github.com/VAST-AI-Research/TripoSG/blob/main/triposg/schedulers/scheduling_rectified_flow.py#L296
+                # While in diffusers's flow matching scheduler, prev_sample = sample + (sigma_next - sigma) * model_output
+                # See https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py#L454
                 target = latents - noise
             else:
                 raise ValueError(f"Unknown training objective [{configs['train']['training_objective']}]")
@@ -765,44 +799,49 @@ def main():
                 accelerator.wait_for_everyone()
                 gc.collect()
 
+            # Evaluate on the validation set
             if args.max_val_steps > 0 and (
-                (global_update_step % configs["train"]["early_eval_freq"] == 0 and global_update_step < configs["train"]["early_eval"])
-                or global_update_step % configs["train"]["eval_freq"] == 0
-                or global_update_step % (configs["train"]["eval_freq_epoch"] * updated_steps_per_epoch) == 0
-                or global_update_step == total_updated_steps
-                or global_update_step == 1
-            ):
+                (global_update_step % configs["train"]["early_eval_freq"] == 0 and global_update_step < configs["train"]["early_eval"])  # 1. more frequently at the beginning
+                or global_update_step % configs["train"]["eval_freq"] == 0  # 2. every `eval_freq` steps
+                or global_update_step % (configs["train"]["eval_freq_epoch"] * updated_steps_per_epoch) == 0  # 3. every `eval_freq_epoch` epochs
+                or global_update_step == total_updated_steps # 4. last step of an epoch
+                or global_update_step == 1 # 5. first step
+            ):  
+
+                # Use EMA parameters for evaluation
                 if args.use_ema:
+                    # Store the Transformer parameters temporarily and load the EMA parameters to perform inference
                     ema_transformer.store(transformer.parameters())
                     ema_transformer.copy_to(transformer.parameters())
 
                 transformer.eval()
 
-                # # --- CORRECTED PART 3: Call the updated validation function ---
-                # log_validation(
-                #     val_loader, random_val_loader,
-                #     tokenizer, text_encoder, # Pass tokenizer and text_encoder
-                #     vae, transformer,
-                #     global_update_step, eval_dir,
-                #     accelerator, logger,
-                #     args, configs
-                # )
+                log_validation(
+                    val_loader, random_val_loader,
+                    feature_extractor_dinov2, image_encoder_dinov2,
+                    vae, transformer,
+                    global_update_step, eval_dir,
+                    accelerator, logger,
+                    args, configs
+                )
 
                 if args.use_ema:
+                    # Switch back to the original Transformer parameters
                     ema_transformer.restore(transformer.parameters())
 
                 torch.cuda.empty_cache()
                 gc.collect()
 
-@torch.no_grad()
 def log_validation(
     dataloader, random_dataloader,
-    tokenizer, text_encoder, # It now accepts tokenizer and text_encoder
-    vae, transformer,
+    feature_extractor_dinov2, image_encoder_dinov2,
+    vae, transformer, 
     global_step, eval_dir,
-    accelerator, logger,
+    accelerator, logger,  
     args, configs
-):
+):  
+
+    
     val_noise_scheduler = RectifiedFlowScheduler.from_pretrained(
         configs["model"]["pretrained_model_name_or_path"],
         subfolder="scheduler"
@@ -812,19 +851,18 @@ def log_validation(
         vae=vae,
         transformer=accelerator.unwrap_model(transformer),
         scheduler=val_noise_scheduler,
-        tokenizer=tokenizer, # Add tokenizer to pipeline
-        text_encoder=text_encoder, # Add text_encoder to pipeline
-        # The original image encoders are no longer needed for text-to-3D
-        feature_extractor_dinov2=None,
-        image_encoder_dinov2=None,
+        feature_extractor_dinov2=feature_extractor_dinov2,
+        image_encoder_dinov2=image_encoder_dinov2,
     )
 
     pipeline.set_progress_bar_config(disable=True)
+    # pipeline.enable_xformers_memory_efficient_attention()
 
     if args.seed >= 0:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
     else:
         generator = None
+        
 
     val_progress_bar = tqdm(
         range(len(dataloader)) if args.max_val_steps is None else range(args.max_val_steps),
@@ -838,22 +876,23 @@ def log_validation(
     val_dataloder, random_val_dataloader = yield_forever(dataloader), yield_forever(random_dataloader)
     val_step = 0
     while val_step < args.max_val_steps:
+
         if val_step < args.max_val_steps // 2:
+            # fix the first half
             batch = next(val_dataloder)
         else:
+            # randomly sample the next batch
             batch = next(random_val_dataloader)
 
-        # Get caption from the batch instead of image
-        caption = batch["caption"]
-        if isinstance(caption, (list, tuple)):
-            caption = caption[0] # Handle cases where it's a list
-
-        # The ground truth parts for comparison
+        images = batch["images"]
+        if len(images.shape) == 5:
+            images = images[0] # (1, N, H, W, 3) -> (N, H, W, 3)
+        images = [Image.fromarray(image) for image in images.cpu().numpy()]
         part_surfaces = batch["part_surfaces"].cpu().numpy()
         if len(part_surfaces.shape) == 4:
-            part_surfaces = part_surfaces[0]
+            part_surfaces = part_surfaces[0] # (1, N, P, 6) -> (N, P, 6)
 
-        N = part_surfaces.shape[0] # Number of parts
+        N = len(images)
 
         val_progress_bar.set_postfix(
             {"num_parts": N}
@@ -861,35 +900,34 @@ def log_validation(
 
         with torch.autocast("cuda", torch.float16):
             for guidance_scale in sorted(args.val_guidance_scales):
-                # Call pipeline with the text prompt
                 pred_part_meshes = pipeline(
-                    prompt=caption, # Use prompt instead of images
-                    num_parts=N, # Tell the pipeline how many parts to generate
+                    images, 
                     num_inference_steps=configs['val']['num_inference_steps'],
                     num_tokens=configs['model']['vae']['num_tokens'],
-                    guidance_scale=guidance_scale,
+                    guidance_scale=guidance_scale, 
+                    attention_kwargs={"num_parts": N},
                     generator=generator,
                     max_num_expanded_coords=configs['val']['max_num_expanded_coords'],
                     use_flash_decoder=configs['val']['use_flash_decoder'],
                 ).meshes
 
-                # ... (The rest of the saving and metric calculation logic can remain largely the same)
+                # Save the generated meshes
                 if accelerator.is_main_process:
                     local_eval_dir = os.path.join(eval_dir, f"{global_step:06d}", f"guidance_scale_{guidance_scale:.1f}")
                     os.makedirs(local_eval_dir, exist_ok=True)
                     rendered_images_list, rendered_normals_list = [], []
-                    # You might want to save the prompt to a text file
-                    with open(os.path.join(local_eval_dir, f"{val_step:04d}_prompt.txt"), "w") as f:
-                        f.write(caption)
-
+                    # 1. save the gt image
+                    images[0].save(os.path.join(local_eval_dir, f"{val_step:04d}.png"))
+                    # 2. save the generated part meshes
                     for n in range(N):
                         if pred_part_meshes[n] is None:
+                            # If the generated mesh is None (decoing error), use a dummy mesh
                             pred_part_meshes[n] = trimesh.Trimesh(vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
                         pred_part_meshes[n].export(os.path.join(local_eval_dir, f"{val_step:04d}_{n:02d}.glb"))
-
+                    # 3. render the generated mesh and save the rendered images
                     pred_mesh = get_colored_mesh_composition(pred_part_meshes)
                     rendered_images: List[Image.Image] = render_views_around_mesh(
-                        pred_mesh,
+                        pred_mesh, 
                         num_views=configs['val']['rendering']['num_views'],
                         radius=configs['val']['rendering']['radius'],
                     )
@@ -911,22 +949,45 @@ def log_validation(
                     rendered_images_list.append(rendered_images)
                     rendered_normals_list.append(rendered_normals)
 
-                    # Note: No GT image to save anymore, but you can log videos
-                    medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/pred_rendered_images"] += rendered_images_list
-                    medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/pred_rendered_normals"] += rendered_normals_list
+                    medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/gt_image"] += [images[0]] # List[Image.Image] TODO: support batch size > 1
+                    medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/pred_rendered_images"] += rendered_images_list # List[List[Image.Image]]
+                    medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/pred_rendered_normals"] += rendered_normals_list # List[List[Image.Image]]
+
+                ################################ Compute generation metrics ################################
 
                 parts_chamfer_distances, parts_f_scores = [], []
+
                 for n in range(N):
-                    # Metric calculation remains the same
-                    parts_chamfer_distances.append(0.0)
-                    parts_f_scores.append(0.0)
+                    gt_part_surface = part_surfaces[n]
+                    pred_part_mesh = pred_part_meshes[n]
+                    if pred_part_mesh is None:
+                        # If the generated mesh is None (decoing error), use a dummy mesh
+                        assert False, "Mesh is None"
+                        # pred_part_mesh = trimesh.Trimesh(vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
+                    part_cd, part_f = compute_cd_and_f_score_in_training(
+                        gt_part_surface, pred_part_mesh,
+                        num_samples=configs['val']['metric']['cd_num_samples'],
+                        threshold=configs['val']['metric']['f1_score_threshold'],
+                        metric=configs['val']['metric']['cd_metric']
+                    )
+                    # avoid nan
+                    part_cd = configs['val']['metric']['default_cd'] if np.isnan(part_cd) else part_cd
+                    part_f = configs['val']['metric']['default_f1'] if np.isnan(part_f) else part_f
+                    parts_chamfer_distances.append(part_cd)
+                    parts_f_scores.append(part_f)
+
+                    # TODO: Fix this
+                    # Disable chamfer distance and F1 score for now
+                    # parts_chamfer_distances.append(0.0)
+                    # parts_f_scores.append(0.0)
 
                 parts_chamfer_distances = torch.tensor(parts_chamfer_distances, device=accelerator.device)
                 parts_f_scores = torch.tensor(parts_f_scores, device=accelerator.device)
 
                 metrics_dictlist[f"parts_chamfer_distance_cfg{guidance_scale:.1f}"].append(parts_chamfer_distances.mean())
                 metrics_dictlist[f"parts_f_score_cfg{guidance_scale:.1f}"].append(parts_f_scores.mean())
-
+            
+        # Only log the last (biggest) cfg metrics in the progress bar
         val_logs = {
             "parts_chamfer_distance": parts_chamfer_distances.mean().item(),
             "parts_f_score": parts_f_scores.mean().item(),
@@ -936,46 +997,52 @@ def log_validation(
             f"Validation [{val_step:02d}/{args.max_val_steps:02d}] " +
             f"parts_chamfer_distance: {val_logs['parts_chamfer_distance']:.4f}, parts_f_score: {val_logs['parts_f_score']:.4f}"
         )
+        logger.info(
+            f"parts_chamfer_distances: {[f'{x:.4f}' for x in parts_chamfer_distances.tolist()]}"
+        )
+        logger.info(
+            f"parts_f_scores: {[f'{x:.4f}' for x in parts_f_scores.tolist()]}"
+        )
         val_step += 1
         val_progress_bar.update(1)
 
     val_progress_bar.close()
 
     if accelerator.is_main_process:
-        # ... (WandB logging logic for videos and metrics can remain the same) ...
         for key, value in medias_dictlist.items():
             if isinstance(value[0], Image.Image): # assuming gt_image
                 image_grid = make_grid_for_images_or_videos(
-                    value,
+                    value, 
                     nrow=configs['val']['nrow'],
-                    return_type='pil',
+                    return_type='pil', 
                 )
                 image_grid.save(os.path.join(eval_dir, f"{global_step:06d}", f"{key}.png"))
                 if not args.no_wandb:
                     wandb.log({f"validation/{key}": wandb.Image(image_grid)}, step=global_step)
             else: # assuming pred_rendered_images or pred_rendered_normals
                 image_grids = make_grid_for_images_or_videos(
-                    value,
+                    value, 
                     nrow=configs['val']['nrow'],
                     return_type='ndarray',
                 )
                 if not args.no_wandb:
                     wandb.log({
                         f"validation/{key}": wandb.Video(
-                            image_grids,
-                            fps=configs['val']['rendering']['fps'],
+                            image_grids, 
+                            fps=configs['val']['rendering']['fps'], 
                             format="gif"
                     )}, step=global_step)
                 image_grids = [Image.fromarray(image_grid.transpose(1, 2, 0)) for image_grid in image_grids]
                 export_renderings(
-                    image_grids,
-                    os.path.join(eval_dir, f"{global_step:06d}", f"{key}.gif"),
+                    image_grids, 
+                    os.path.join(eval_dir, f"{global_step:06d}", f"{key}.gif"), 
                     fps=configs['val']['rendering']['fps']
                 )
 
         for k, v in metrics_dictlist.items():
             if not args.no_wandb:
                 wandb.log({f"validation/{k}": torch.tensor(v).mean().item()}, step=global_step)
+
 
 
 if __name__ == "__main__":
