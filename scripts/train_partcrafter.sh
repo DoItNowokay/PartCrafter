@@ -1,5 +1,5 @@
 NUM_MACHINES=1
-NUM_LOCAL_GPUS=8
+NUM_LOCAL_GPUS=1
 MACHINE_RANK=0
 
 export WANDB_API_KEY="" # Modify this if you use wandb

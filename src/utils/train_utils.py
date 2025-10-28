@@ -129,6 +129,8 @@ def get_configs(yaml_path: str, cli_configs: List[str]=[], **kwargs) -> DictConf
 def get_optimizer(name: str, params: Parameter, **kwargs) -> Optimizer:
     if name == "adamw":
         return optim.AdamW(params=params, **kwargs)
+    elif name == "bnb":
+        return bnb.optim.AdamW8bit(params=params, **kwargs)
     else:
         raise NotImplementedError(f"Not implemented optimizer: {name}")
 

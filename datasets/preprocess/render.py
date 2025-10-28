@@ -4,6 +4,8 @@ import numpy as np
 import argparse
 import json
 
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from src.utils.data_utils import normalize_mesh
 from src.utils.render_utils import render_single_view
 
