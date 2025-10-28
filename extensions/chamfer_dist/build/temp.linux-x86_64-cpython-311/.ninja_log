@@ -1,0 +1,3 @@
+# ninja log v5
+1	14833	1757760626975774251	/neuro/tracto/github/MTP1/extensions/chamfer_dist/build/temp.linux-x86_64-cpython-311/chamfer_cuda.o	2b66e914619cd5f0
+0	41671	1757760653807835786	/neuro/tracto/github/MTP1/extensions/chamfer_dist/build/temp.linux-x86_64-cpython-311/chamfer.o	638ec6b5dad5c2d9
