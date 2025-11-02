@@ -18,6 +18,13 @@ from src.utils.render_utils import render_views_around_mesh, render_normal_views
 from src.pipelines.pipeline_partcrafter import PartCrafterPipeline
 from src.utils.image_utils import prepare_image
 from src.models.briarmbg import BriaRMBG
+from src.models.transformers import PartCrafterDiTModel
+from src.models.autoencoders import TripoSGVAEModel
+from src.schedulers import RectifiedFlowScheduler
+from transformers import (
+    BitImageProcessor,
+    Dinov2Model,
+)
 
 @torch.no_grad()
 def run_triposg(
@@ -78,6 +85,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_flash_decoder", action="store_true")
     parser.add_argument("--rmbg", action="store_true")
     parser.add_argument("--render", action="store_true")
+    parser.add_argument("--custom_trns", type=str, default=None, help="Path to your custom transformer weights")
     args = parser.parse_args()
 
     assert 1 <= args.num_parts <= MAX_NUM_PARTS, f"num_parts must be in [1, {MAX_NUM_PARTS}]"
@@ -85,7 +93,8 @@ if __name__ == "__main__":
     # download pretrained weights
     partcrafter_weights_dir = "pretrained_weights/PartCrafter"
     rmbg_weights_dir = "pretrained_weights/RMBG-1.4"
-    snapshot_download(repo_id="wgsxm/PartCrafter", local_dir=partcrafter_weights_dir)
+    if args.custom_trns is None:
+        snapshot_download(repo_id="wgsxm/PartCrafter", local_dir=partcrafter_weights_dir)
     snapshot_download(repo_id="briaai/RMBG-1.4", local_dir=rmbg_weights_dir)
 
     # init rmbg model for background removal
@@ -93,7 +102,28 @@ if __name__ == "__main__":
     rmbg_net.eval() 
 
     # init tripoSG pipeline
-    pipe: PartCrafterPipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir).to(device, dtype)
+    # pipe: PartCrafterPipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir).to(device, dtype)
+    if args.custom_trns:
+        print("Loading custom transformer...")
+        vae = TripoSGVAEModel.from_pretrained(partcrafter_weights_dir, subfolder="vae")
+        
+        # Load your custom transformer
+        transformer = PartCrafterDiTModel.from_pretrained(args.custom_trns)
+
+        scheduler = RectifiedFlowScheduler.from_pretrained(partcrafter_weights_dir, subfolder="scheduler")
+        image_encoder_dinov2 = Dinov2Model.from_pretrained(partcrafter_weights_dir, subfolder="image_encoder_dinov2")
+        feature_extractor_dinov2 = BitImageProcessor.from_pretrained(partcrafter_weights_dir, subfolder="feature_extractor_dinov2")
+
+        pipe: PartCrafterPipeline = PartCrafterPipeline(
+            vae=vae,
+            transformer=transformer,
+            scheduler=scheduler,
+            image_encoder_dinov2=image_encoder_dinov2,
+            feature_extractor_dinov2=feature_extractor_dinov2,
+        ).to(device, dtype)
+
+    else:
+        pipe: PartCrafterPipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir).to(device, dtype)
 
     set_seed(args.seed)
 

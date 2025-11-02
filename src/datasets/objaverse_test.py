@@ -44,7 +44,7 @@ class ObjaversePartEvalDataset(Dataset):
                     part_surfaces.append(torch.zeros((1, 3)))
 
             self.data.append({
-                "image": object_image,
+                "image": image_path,
                 "part_surfaces": part_surfaces,
                 "num_parts": num_parts
             })
@@ -55,17 +55,18 @@ class ObjaversePartEvalDataset(Dataset):
 
     def __getitem__(self, index):
         item = self.data[index]
-        image_tensor = self.transform(item['image'])
+        # image_tensor = self.transform(item['image'])
         
         return {
-            "image": image_tensor,
+            "image": item['image'],
             "part_surfaces": item['part_surfaces'],
             "num_parts": item['num_parts']
         }
 
 def collate_fn_eval(batch):
 
-    images = torch.stack([item['image'] for item in batch])
+    # images = torch.stack([item['image'] for item in batch])
+    images = [item['image'] for item in batch]
     part_surfaces = [item['part_surfaces'] for item in batch]
     num_parts = [item['num_parts'] for item in batch]
     

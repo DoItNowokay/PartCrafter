@@ -31,7 +31,7 @@ test:
   min_num_parts: 2
   max_num_parts: 8
   num_inference_steps: 50
-  max_num_expanded_coords: 1e8
+  max_num_expanded_coords: 1e9
   use_flash_decoder: false
   rendering:
     radius: 4.0

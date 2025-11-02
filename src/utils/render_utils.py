@@ -261,7 +261,10 @@ def render_single_view(
     if isinstance(mesh, trimesh.Trimesh):
         mesh = trimesh.Scene(mesh)
 
-    scene = pyrender.Scene.from_trimesh_scene(mesh)
+    try:
+        scene = pyrender.Scene.from_trimesh_scene(mesh)
+    except:
+        scene = pyrender.Scene.from_trimesh_scene(mesh, geom_kwargs=dict(smooth=False, material=None))
     light = pyrender.DirectionalLight(
         color=np.ones(3), 
         intensity=light_intensity

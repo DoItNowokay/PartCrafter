@@ -318,6 +318,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         # 7. decoder mesh
         self.vae.set_flash_decoder()
         output, meshes = [], []
+        # print(latents)
         self.set_progress_bar_config(
             desc="Decoding", 
             ncols=125,
@@ -337,14 +338,17 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         max_num_expanded_coords=max_num_expanded_coords,
                         # verbose=True
                     )
-                    mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
+                    mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float16), mesh_v_f[1])
                 except:
-                    mesh_v_f = None
                     mesh = None
+                    mesh_v_f = None
+                    print(f"PartCrafterPipeline: RuntimeError in decoding mesh {i}, setting to None")
                 output.append(mesh_v_f)
                 meshes.append(mesh)
                 progress_bar.update()
-       
+                
+        # print(meshes)
+        # print(output)
         # Offload all models
         self.maybe_free_model_hooks()
 

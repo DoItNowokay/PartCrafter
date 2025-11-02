@@ -4,6 +4,7 @@ import torch
 
 from .objaverse_part import ObjaversePartDataset, BatchedObjaversePartDataset
 from .objaverse_captions import ObjaverseCaptionDataset, BatchedObjaverseCaptionDataset
+from .objaverse_test import ObjaversePartEvalDataset, collate_fn_eval
 
 # Copied from https://github.com/huggingface/pytorch-image-models/blob/main/timm/data/loader.py
 class MultiEpochsDataLoader(torch.utils.data.DataLoader):
