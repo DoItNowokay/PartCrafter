@@ -18,6 +18,7 @@ import trimesh
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+import wandb
 import torch
 import accelerate
 from accelerate import Accelerator
@@ -30,7 +31,7 @@ from src.schedulers import RectifiedFlowScheduler
 from src.models.autoencoders import TripoSGVAEModel
 from src.models.transformers import PartCrafterDiTModel
 from src.pipelines.pipeline_partcrafter import PartCrafterPipeline
-from src.utils.train_utils import get_configs
+from src.utils.train_utils import get_configs, save_experiment_params, save_model_architecture
 from src.utils.metric_utils import compute_cd_and_f_score_cuda
 from src.models.briarmbg import BriaRMBG
 from src.utils.image_utils import prepare_image
@@ -152,6 +153,15 @@ def run_evaluation(
                 metrics_summary[guidance_scale]["chamfer"].extend(batch_cds)
                 metrics_summary[guidance_scale]["f1_score"].extend(batch_f_scores)
 
+                # Log per-item metrics/media to Weights & Biases (main process only)
+                if accelerator.is_main_process and (not args.no_wandb):
+                    item_logs = {
+                        f"evaluation/cd_cfg{guidance_scale:.1f}": float(np.mean(batch_cds)),
+                        f"evaluation/f1_cfg{guidance_scale:.1f}": float(np.mean(batch_f_scores)),
+                        "evaluation/num_parts": int(num_parts),
+                    }
+                    wandb.log(item_logs, step=step)
+
                 if accelerator.is_main_process and args.save_visuals:
                     # ... (rest of the visualization logic remains identical) ...
                     local_eval_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
@@ -175,6 +185,13 @@ def run_evaluation(
 
                         export_renderings(rendered_images, os.path.join(local_eval_dir, "rendering.gif"), fps=render_cfg.get('fps', 18))
                         rendered_images[0].save(os.path.join(local_eval_dir, "rendering.png"))
+                        # Also log media to wandb if enabled
+                        if not args.no_wandb:
+                            wandb.log({
+                                f"evaluation/gs_{guidance_scale:.1f}/input_image": wandb.Image(input_image_pil),
+                                f"evaluation/gs_{guidance_scale:.1f}/render_grid": wandb.Image(rendered_grids),
+                                f"evaluation/gs_{guidance_scale:.1f}/render_video": wandb.Video(os.path.join(local_eval_dir, "rendering.gif"), fps=render_cfg.get('fps', 18), format="gif"),
+                            }, step=step)
                     else:
                         logger.warning(f"Step: {step:04d} | GS: {guidance_scale:<4.1f} | No valid meshes to merge for visualization.")
 
@@ -197,6 +214,23 @@ def run_evaluation(
                 logger.info(log_msg)
                 f.write(log_msg + "\n")
         logger.info(f"\nResults saved to {report_path}")
+        # Log aggregate metrics and artifacts to wandb
+        if not args.no_wandb:
+            aggregate_logs = {}
+            for guidance_scale, metrics in sorted(metrics_summary.items()):
+                aggregate_logs.update({
+                    f"evaluation/avg_cd_cfg{guidance_scale:.1f}": float(np.mean(metrics["chamfer"])) if len(metrics["chamfer"]) else float('nan'),
+                    f"evaluation/avg_f1_cfg{guidance_scale:.1f}": float(np.mean(metrics["f1_score"])) if len(metrics["f1_score"]) else float('nan'),
+                })
+            if aggregate_logs:
+                wandb.log(aggregate_logs)
+            # Attach result file as an artifact
+            arti = wandb.Artifact(args.tag + "_eval", type="evaluation")
+            arti.add_file(report_path)
+            log_path = os.path.join(eval_dir, "log.txt")
+            if os.path.exists(log_path):
+                arti.add_file(log_path)
+            wandb.log_artifact(arti)
         
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a PartCrafter model.")
@@ -209,6 +243,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers. Set to 0 to avoid I/O bottlenecks.")
     parser.add_argument("--test_guidance_scales", type=float, nargs="+", default=[7.0], help="List of CFG scales to test.")
     parser.add_argument("--save_visuals", action='store_true', help="Save generated meshes and renders.")
+    parser.add_argument("--offline_wandb", action="store_true", help="Use offline WandB for experiment tracking")
+    parser.add_argument("--no_wandb", action="store_true", help="Disable WandB for experiment tracking")
     args, extras = parser.parse_known_args()
     configs = get_configs(args.config, extras)
 
@@ -226,6 +262,9 @@ def main():
 
     if args.seed >= 0:
         accelerate.utils.set_seed(args.seed)
+
+    # Save experiment parameters to eval_dir for reproducibility and W&B
+    exp_params = save_experiment_params(args, configs, eval_dir)
 
     # <<< MODIFICATION: Match inference_partcrafter.py loading >>>
     logger.info("Downloading base models and RMBG...")
@@ -259,6 +298,28 @@ def main():
     pipeline = PartCrafterPipeline(vae=vae, transformer=transformer, scheduler=scheduler, feature_extractor_dinov2=feature_extractor, image_encoder_dinov2=image_encoder)
     pipeline.to(accelerator.device, weight_dtype)
     pipeline.set_progress_bar_config(disable=True)
+
+    # Save model architecture summary and initialize Weights & Biases
+    if accelerator.is_main_process:
+        try:
+            save_model_architecture(transformer, eval_dir)
+        except Exception:
+            pass
+    if accelerator.is_main_process and (not args.no_wandb):
+        if args.offline_wandb:
+            os.environ["WANDB_MODE"] = "offline"
+        wandb.init(project="PartCrafter", name=args.tag, config=exp_params, dir=eval_dir, resume=True)
+        arti_exp_info = wandb.Artifact(args.tag, type="eval_info")
+        params_path = os.path.join(eval_dir, "params.yaml")
+        model_path = os.path.join(eval_dir, "model.txt")
+        log_path = os.path.join(eval_dir, "log.txt")
+        if os.path.exists(params_path):
+            arti_exp_info.add_file(params_path)
+        if os.path.exists(model_path):
+            arti_exp_info.add_file(model_path)
+        if os.path.exists(log_path):
+            arti_exp_info.add_file(log_path)
+        wandb.log_artifact(arti_exp_info)
     
     logger.info("Loading test dataset...")
     test_dataset = ObjaversePartEvalDataset(configs=configs, mode='test')
@@ -292,6 +353,10 @@ def main():
         eval_dir=eval_dir,
         rmbg_net=rmbg_net  # <<< MODIFICATION: Pass rmbg_net >>>
     )
+
+    # Finish W&B run
+    if accelerator.is_main_process and (not args.no_wandb):
+        wandb.finish()
 
 if __name__ == "__main__":
     main()

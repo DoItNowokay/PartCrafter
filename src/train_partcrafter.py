@@ -43,6 +43,7 @@ from src.schedulers import RectifiedFlowScheduler
 from src.models.autoencoders import TripoSGVAEModel
 from src.models.transformers import PartCrafterDiTModel
 from src.pipelines.pipeline_partcrafter import PartCrafterPipeline
+from src.models.condition_processor import ConditionProcessor
 
 from src.datasets import (
     ObjaversePartDataset,
@@ -218,8 +219,7 @@ def main():
     )
     parser.add_argument(
         "--text_conditioning",
-        type=bool,
-        default=False,
+        action="store_true",
         help="Whether to use text conditioning for training"
     )
     parser.add_argument(
@@ -370,8 +370,6 @@ def main():
         configs["model"]["pretrained_model_name_or_path"],
         subfolder="image_encoder_dinov2"
     )
-
-    # --- CORRECTED PART 1: Initialize both tokenizer and text_encoder ---
     if args.text_conditioning:
         tokenizer = CLIPTokenizer.from_pretrained(
             configs["model"]["text_encoder_name"]
@@ -379,6 +377,14 @@ def main():
         text_encoder = CLIPTextModel.from_pretrained(
             configs["model"]["text_encoder_name"]
         )
+    if "condition_processor" in os.listdir(configs["model"]["pretrained_model_name_or_path"]):
+        condition_processor = ConditionProcessor.from_pretrained(
+            configs["model"]["pretrained_model_name_or_path"],
+            subfolder="condition_processor"
+        )
+    else:
+        # initialize a new condition processor
+        condition_processor = ConditionProcessor(configs["model"])
 
     enable_part_embedding = configs["model"]["transformer"].get("enable_part_embedding", True)
     enable_local_cross_attn = configs["model"]["transformer"].get("enable_local_cross_attn", True)
@@ -540,8 +546,8 @@ def main():
     if "num_warmup_steps" in configs["lr_scheduler"]:
         configs["lr_scheduler"]["num_warmup_steps"] //= accelerator.num_processes
 
-    transformer, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader = accelerator.prepare(
-        transformer, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader
+    transformer, condition_processor, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader = accelerator.prepare(
+        transformer, condition_processor, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader
     )
 
     if args.use_ema:
@@ -555,6 +561,7 @@ def main():
 
     vae.to(accelerator.device, dtype=weight_dtype)
     image_encoder_dinov2.to(accelerator.device, dtype=weight_dtype)
+    condition_processor.to(accelerator.device, dtype=weight_dtype)
     if args.text_conditioning: text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     updated_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
@@ -638,8 +645,9 @@ def main():
             return
 
         transformer.train()
+        condition_processor.train()
 
-        with accelerator.accumulate(transformer):
+        with accelerator.accumulate(transformer, condition_processor):
 
             images = batch["images"]
             with torch.no_grad():
@@ -650,7 +658,7 @@ def main():
             negative_image_embeds = torch.zeros_like(image_embeds)
 
             # --- CORRECTED PART 2: Use the initialized tokenizer instance ---
-            if args.text_conditioning: 
+            if args.text_conditioning:
                 texts = batch["captions"]
                 with torch.no_grad():
                     text_inputs = tokenizer(
@@ -700,9 +708,9 @@ def main():
             sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
             latent_model_input = noisy_latents = (1. - sigmas) * latents + sigmas * noise
             
-            if args.text_conditioning:
-                text_embeds = text_embeds.repeat_interleave(num_parts, dim=0)
-                negative_text_embeds = negative_text_embeds.repeat_interleave(num_parts, dim=0)
+            # if args.text_conditioning:
+            #     text_embeds = text_embeds.repeat_interleave(num_parts, dim=0)
+            #     negative_text_embeds = negative_text_embeds.repeat_interleave(num_parts, dim=0)
 
             if configs["train"]["cfg_dropout_prob"] > 0:
                 dropout_mask = torch.rand(num_objects, device=accelerator.device) < configs["train"]["cfg_dropout_prob"]
@@ -711,10 +719,14 @@ def main():
                     image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
                     if args.text_conditioning: text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
 
+            if not args.text_conditioning:
+                image_embeds = condition_processor(image=image_embeds, text=None) # this can be used for both text and image
+            else:
+                image_embeds = condition_processor(image=None, text=text_embeds)
             model_pred = transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
-                encoder_hidden_states=image_embeds if args.text_conditioning == False else text_embeds,
+                encoder_hidden_states=image_embeds,
                 attention_kwargs={"num_parts": num_parts}
             ).sample
 
@@ -815,11 +827,14 @@ def main():
                     ema_transformer.copy_to(transformer.parameters())
 
                 transformer.eval()
+                condition_processor.eval()
 
                 log_validation(
+                    args,
                     val_loader, random_val_loader,
                     feature_extractor_dinov2, image_encoder_dinov2,
-                    vae, transformer,
+                    tokenizer, text_encoder,
+                    vae, transformer, condition_processor,
                     global_update_step, eval_dir,
                     accelerator, logger,
                     args, configs
@@ -833,9 +848,11 @@ def main():
                 gc.collect()
 
 def log_validation(
+    args,
     dataloader, random_dataloader,
     feature_extractor_dinov2, image_encoder_dinov2,
-    vae, transformer, 
+    tokenizer, text_encoder,
+    vae, transformer, condition_processor,
     global_step, eval_dir,
     accelerator, logger,  
     args, configs
@@ -848,11 +865,15 @@ def log_validation(
     )
 
     pipeline = PartCrafterPipeline(
+        args,
         vae=vae,
         transformer=accelerator.unwrap_model(transformer),
+        condition_processor=accelerator.unwrap_model(condition_processor),
         scheduler=val_noise_scheduler,
         feature_extractor_dinov2=feature_extractor_dinov2,
         image_encoder_dinov2=image_encoder_dinov2,
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
     )
 
     pipeline.set_progress_bar_config(disable=True)

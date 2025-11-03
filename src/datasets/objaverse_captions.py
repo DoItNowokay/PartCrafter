@@ -45,7 +45,31 @@ class ObjaverseCaptionDataset(torch.utils.data.Dataset):
         caps3d_csv_path = configs['dataset']['caps3d_csv_path']
         try:
             caps3d_df = pd.read_csv(caps3d_csv_path)
+        except FileNotFoundError:
+            print(f"Warning: Caps3D CSV file not found at: {caps3d_csv_path}")
+            self.uid_to_caption = {}
+        try:
+            # CSV has no header: first column = uid, second = caption (may contain commas; assumed quoted)
+            caps3d_df = pd.read_csv(
+                caps3d_csv_path,
+                header=None,
+                names=["uid", "text"],
+                quotechar='"',
+                encoding="utf-8",
+                dtype=str,
+                keep_default_na=False,
+            )
+            # If the file parsed into more than 2 columns (malformed), join everything after the first as the caption.
+            if caps3d_df.shape[1] > 2:
+                caps3d_df["text"] = caps3d_df.iloc[:, 1:].astype(str).agg(",".join, axis=1)
+            caps3d_df["uid"] = caps3d_df["uid"].str.strip()
+            caps3d_df["text"] = caps3d_df["text"].str.strip().str.strip('"')
             self.uid_to_caption = dict(zip(caps3d_df["uid"], caps3d_df["text"]))
+            # print 10 sample captions with random uids
+            # sample_items = random.sample(self.uid_to_caption.items(), min(10, len(self.uid_to_caption)))
+            sample_items = list(self.uid_to_caption.items())[:10]
+            for uid, caption in sample_items:
+                print(f"Sample caption - UID: {uid}, Caption: {caption}")
         except FileNotFoundError:
             print(f"Warning: Caps3D CSV file not found at: {caps3d_csv_path}")
             self.uid_to_caption = {}
@@ -116,11 +140,14 @@ class ObjaverseCaptionDataset(torch.utils.data.Dataset):
 
         uid = data_config["uid"]
         caption = self.uid_to_caption.get(uid, "")
+        if caption == "":
+            print('problem')
+        captions = [caption] * part_surfaces.shape[0]
 
         return {
             "images": images,
             "part_surfaces": part_surfaces,
-            "caption": caption, 
+            "captions": captions,
         }
 
     def __getitem__(self, idx: int):
@@ -202,8 +229,9 @@ class BatchedObjaverseCaptionDataset(ObjaverseCaptionDataset):
         images = torch.cat([data['images'] for data in batch], dim=0)
         surfaces = torch.cat([data['part_surfaces'] for data in batch], dim=0) 
         num_parts = torch.LongTensor([data['part_surfaces'].shape[0] for data in batch])
-        
-        captions = [data['caption'] for data in batch]
+
+        captions = [data['captions'] for data in batch]
+        captions = sum(captions, [])  # flatten list of lists
 
         assert images.shape[0] == surfaces.shape[0] == num_parts.sum() == self.batch_size
         batch = {

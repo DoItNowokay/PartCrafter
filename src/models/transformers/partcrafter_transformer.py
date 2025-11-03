@@ -664,8 +664,6 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         _, T, _ = hidden_states.shape
 
         temb = self.time_embed(timestep).to(hidden_states.dtype)
-        # print('temp.dtype:', temb.dtype)
-        # print('self.time_proj.dtype:', self.time_proj.dtype)
         temb = self.time_proj(temb)
         temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
 

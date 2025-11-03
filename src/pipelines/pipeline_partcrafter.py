@@ -20,8 +20,16 @@ from ..utils.inference_utils import hierarchical_extract_geometry
 
 from ..models.autoencoders import TripoSGVAEModel
 from ..models.transformers import PartCrafterDiTModel
+from ..models.condition_processor import ConditionProcessor
 from .pipeline_partcrafter_output import PartCrafterPipelineOutput
 from .pipeline_utils import TransformerDiffusionMixin
+
+from transformers import (
+    BitImageProcessor,
+    Dinov2Model,
+    CLIPTextModel,
+    CLIPTokenizer
+)
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -101,17 +109,21 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self,   
         vae: TripoSGVAEModel,
         transformer: PartCrafterDiTModel,
+        condition_processor: ConditionProcessor,
         scheduler: FlowMatchEulerDiscreteScheduler,
         image_encoder_dinov2: Dinov2Model,
         feature_extractor_dinov2: BitImageProcessor,
+        tokenizer: CLIPTokenizer,
+        text_encoder: CLIPTextModel,
     ):
         super().__init__()
 
         self.register_modules(
             vae=vae,
             transformer=transformer,
+            condition_processor=condition_processor,
             scheduler=scheduler,
-            image_encoder_dinov2=image_encoder_dinov2,
+            image_encoder_dinov2=image_encoder_dinov2,  
             feature_extractor_dinov2=feature_extractor_dinov2,
         )
 
@@ -220,6 +232,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
 
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
+        
+        image_embeds = self.condition_processor(image=image_embeds, text=None) # this can be used for both text and image
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
