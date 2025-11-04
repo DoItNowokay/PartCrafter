@@ -38,7 +38,7 @@ lr_scheduler:
   num_warmup_steps: 1000
 
 train:
-  batch_size_per_gpu: 4
+  batch_size_per_gpu: 8
   epochs: 10
   grad_checkpoint: true
   weighting_scheme: "logit_normal"

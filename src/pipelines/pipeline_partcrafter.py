@@ -24,6 +24,7 @@ from ..models.condition_processor import ConditionProcessor
 from .pipeline_partcrafter_output import PartCrafterPipelineOutput
 from .pipeline_utils import TransformerDiffusionMixin
 
+
 from transformers import (
     BitImageProcessor,
     Dinov2Model,
@@ -113,8 +114,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         scheduler: FlowMatchEulerDiscreteScheduler,
         image_encoder_dinov2: Dinov2Model,
         feature_extractor_dinov2: BitImageProcessor,
-        tokenizer: CLIPTokenizer,
         text_encoder: CLIPTextModel,
+        tokenizer: CLIPTokenizer,
     ):
         super().__init__()
 
@@ -125,6 +126,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             scheduler=scheduler,
             image_encoder_dinov2=image_encoder_dinov2,  
             feature_extractor_dinov2=feature_extractor_dinov2,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
         )
 
     @property
@@ -163,6 +166,21 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         uncond_image_embeds = torch.zeros_like(image_embeds)
 
         return image_embeds, uncond_image_embeds
+    
+    def encode_text(self, texts, device):
+        if isinstance(texts[0], list):
+            texts = [t[0] for t in texts]
+            
+        text_inputs = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(device)
+
+        text_embeds = self.text_encoder(**text_inputs).last_hidden_state
+        uncond_text_embeds = torch.zeros_like(text_embeds)
+        return text_embeds, uncond_text_embeds
 
     def prepare_latents(
         self,
@@ -189,6 +207,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
     def __call__(
         self,
         image: PipelineImageInput,
+        captions: Optional[List[str]] = None,
         num_inference_steps: int = 50,
         num_tokens: int = 2048,
         timesteps: List[int] = None,
@@ -213,27 +232,45 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self._interrupt = False
 
         # 2. Define call parameters
-        if isinstance(image, PIL.Image.Image):
-            batch_size = 1
-        elif isinstance(image, list):
-            batch_size = len(image)
-        elif isinstance(image, torch.Tensor):
-            batch_size = image.shape[0]
+        if image is not None:
+            if isinstance(image, PIL.Image.Image):
+                batch_size = 1
+            elif isinstance(image, list):
+                batch_size = len(image)
+            elif isinstance(image, torch.Tensor):
+                batch_size = image.shape[0]
+            else:
+                raise ValueError("Invalid input type for image")
         else:
-            raise ValueError("Invalid input type for image")
+            if isinstance(captions, str):
+                captions = [captions]
+            batch_size = len(captions)
 
         device = self._execution_device
         dtype = self.image_encoder_dinov2.dtype
+        if captions is None:
+            # 3. Encode condition
+            image_embeds, negative_image_embeds = self.encode_image(
+                image, device, num_images_per_prompt
+            )
+            image_embeds = self.condition_processor(text=None, image=image_embeds)
+            negative_image_embeds = self.condition_processor(text=None, image=negative_image_embeds)
 
-        # 3. Encode condition
-        image_embeds, negative_image_embeds = self.encode_image(
-            image, device, num_images_per_prompt
-        )
-
-        if self.do_classifier_free_guidance:
-            image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
-        
-        image_embeds = self.condition_processor(image=image_embeds, text=None) # this can be used for both text and image
+            if self.do_classifier_free_guidance:
+                image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
+                
+        else:
+            # print(captions)
+            image_embeds, negative_image_embeds = self.encode_text(
+                captions, device
+            )
+            image_embeds = self.condition_processor(text=image_embeds, image=None)
+            negative_image_embeds = self.condition_processor(text=negative_image_embeds, image=None)
+            
+            if self.do_classifier_free_guidance:
+                image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
+            
+        # image_embeds = self.condition_processor(image=image_embeds, text=None) # this can be used for both text and image
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(

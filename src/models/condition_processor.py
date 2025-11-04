@@ -7,9 +7,9 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 # class ConditionProcessor(ConfigMixin, ModelMixin, nn.Module):
 # class ConditionProcessor(nn.Module, ConfigMixin):
-class ConditionProcessor(ConfigMixin, ModelMixin, nn.Module):
-    config_name = "ConditionProcessorConfig"
-    @register_to_config
+class ConditionProcessor(ModelMixin, nn.Module):
+    # config_name = "ConditionProcessorConfig"
+    # @register_to_config
     def __init__(self, config):
         super().__init__()
         self.text_feature_dim = 768
