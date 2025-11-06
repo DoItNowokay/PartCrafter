@@ -232,43 +232,36 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self._interrupt = False
 
         # 2. Define call parameters
-        if image is not None:
-            if isinstance(image, PIL.Image.Image):
-                batch_size = 1
-            elif isinstance(image, list):
-                batch_size = len(image)
-            elif isinstance(image, torch.Tensor):
-                batch_size = image.shape[0]
-            else:
-                raise ValueError("Invalid input type for image")
+        # if image is not None:
+        if isinstance(image, PIL.Image.Image):
+            batch_size = 1
+        elif isinstance(image, list):
+            batch_size = len(image)
+        elif isinstance(image, torch.Tensor):
+            batch_size = image.shape[0]
         else:
-            if isinstance(captions, str):
-                captions = [captions]
-            batch_size = len(captions)
+            raise ValueError("Invalid input type for image")
+        # else:
+        if isinstance(captions, str):
+            captions = [captions]
+        batch_size = len(captions)
 
         device = self._execution_device
         dtype = self.image_encoder_dinov2.dtype
-        if captions is None:
-            # 3. Encode condition
-            image_embeds, negative_image_embeds = self.encode_image(
-                image, device, num_images_per_prompt
-            )
-            image_embeds = self.condition_processor(text=None, image=image_embeds)
-            negative_image_embeds = self.condition_processor(text=None, image=negative_image_embeds)
-
-            if self.do_classifier_free_guidance:
-                image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
-                
-        else:
-            # print(captions)
-            image_embeds, negative_image_embeds = self.encode_text(
-                captions, device
-            )
-            image_embeds = self.condition_processor(text=image_embeds, image=None)
-            negative_image_embeds = self.condition_processor(text=negative_image_embeds, image=None)
-            
-            if self.do_classifier_free_guidance:
-                image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
+        # if captions is None:
+        # 3. Encode condition
+        image_embeds, negative_image_embeds = self.encode_image(
+            image, device, num_images_per_prompt
+        )
+        text_embeds, negative_text_embeds = self.encode_text(
+            captions, device
+        )
+        num_parts = torch.tensor([batch_size], device=device)
+        loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, num_parts=num_parts)
+        loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, num_parts=num_parts)
+        
+        if self.do_classifier_free_guidance:
+            image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
             
         # image_embeds = self.condition_processor(image=image_embeds, text=None) # this can be used for both text and image
 

@@ -12,7 +12,12 @@ dataset:
   config: 
     # - 'datasets/object_part_configs.json' # Modify this path if you use your own dataset
     # - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/object_part_configs.json'
-    - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/object_part_configs.json'
+    # - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/object_part_configs.json'
+    - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/000-000/object_part_configs.json'
+    - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/000-001/object_part_configs.json'
+    - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/000-002/object_part_configs.json'
+    - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/000-003/object_part_configs.json'
+    - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/000-000/object_part_configs.json'
   caps3d_csv_path: 'preprocessed_data/Cap3D_automated_Objaverse_full.csv'
   training_ratio: 0.9
   min_num_parts: 1
@@ -39,7 +44,7 @@ lr_scheduler:
 
 train:
   batch_size_per_gpu: 8
-  epochs: 10
+  epochs: 1000
   grad_checkpoint: true
   weighting_scheme: "logit_normal"
   logit_mean: 0.0
@@ -50,8 +55,10 @@ train:
   log_freq: 1
   early_eval_freq: 500
   early_eval: 1000
-  eval_freq: 1000
-  save_freq: 2000
+  # eval_freq: 1000
+  eval_freq: 200
+  # save_freq: 2000
+  save_freq: 200
   eval_freq_epoch: 5
   save_freq_epoch: 10
   ema_kwargs:
@@ -60,7 +67,8 @@ train:
     inv_gamma: 1.
     power: 0.75
   # trainable_modules: "blocks.12.,blocks.13.,blocks.14.,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20."
-  trainable_modules: "time_embed,time_proj,part,proj_in,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
+  trainable_modules: "blocks.19.,blocks.20."
+  # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
   # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.17.,blocks.18.,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
   # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
   # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.13.,blocks.14.,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"

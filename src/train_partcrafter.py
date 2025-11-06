@@ -1,4 +1,6 @@
+import itertools
 import warnings
+from xml.parsers.expat import model
 warnings.filterwarnings("ignore")  # ignore all warnings
 import diffusers.utils.logging as diffusion_logging
 diffusion_logging.set_verbosity_error()  # ignore diffusers warnings
@@ -219,8 +221,10 @@ def main():
     )
     parser.add_argument(
         "--text_conditioning",
-        action="store_true",
-        help="Whether to use text conditioning for training"
+        type=str,
+        default="none",
+        choices=["none", "direct_text", "contrastive_text"],
+        help="Whether to use text conditioning and which type"
     )
     parser.add_argument(
         "--editing",
@@ -377,14 +381,26 @@ def main():
         text_encoder = CLIPTextModel.from_pretrained(
             configs["model"]["text_encoder_name"]
         )
-    if "condition_processor" in os.listdir(configs["model"]["pretrained_model_name_or_path"]):
+    if args.load_pretrained_model:
+        # condition_processor = ConditionProcessor.from_pretrained(
+        #     configs["model"]["pretrained_model_name_or_path"],
+        #     subfolder="condition_processor"
+        # )
+        logger.info(f"Load pretrained ConditionProcessor to initialize from [{args.load_pretrained_model}] iteration [{args.load_pretrained_model_ckpt:06d}]\n")
         condition_processor = ConditionProcessor.from_pretrained(
             configs["model"]["pretrained_model_name_or_path"],
-            subfolder="condition_processor"
+            subfolder="condition_processor",
+            text_conditioning=args.text_conditioning
         )
     else:
-        # initialize a new condition processor
-        condition_processor = ConditionProcessor(configs["model"])
+        logger.info("Initialize ConditionProcessor from pretrained model\n")
+        condition_processor = ConditionProcessor.from_config(
+            os.path.join(
+                configs["model"]["pretrained_model_name_or_path"],
+                "condition_processor"
+            ),
+            text_conditioning=args.text_conditioning
+        )
 
     enable_part_embedding = configs["model"]["transformer"].get("enable_part_embedding", True)
     enable_local_cross_attn = configs["model"]["transformer"].get("enable_local_cross_attn", True)
@@ -459,13 +475,14 @@ def main():
             **configs["train"]["ema_kwargs"]
         )
 
-    # Freeze VAE and image encoder
+    # Freeze VAE, image encoder, and text encoder
     vae.requires_grad_(False)
     image_encoder_dinov2.requires_grad_(False)
-    if args.text_conditioning: text_encoder.requires_grad_(False)
     vae.eval()
     image_encoder_dinov2.eval()
-    if args.text_conditioning: text_encoder.eval()
+    if args.text_conditioning != "none":
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
 
     trainable_modules = configs["train"].get("trainable_modules", None)
     if trainable_modules is None:
@@ -482,29 +499,97 @@ def main():
         logger.info(f"Trainable parameter names: {trainable_module_names}\n")
 
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        def save_model_hook(models, weights, output_dir):
-            if accelerator.is_main_process:
-                if args.use_ema:
-                    ema_transformer.save_pretrained(os.path.join(output_dir, "transformer_ema"))
+        def _subfolder_for_model(model):
+            # map model type/name to a sensible subfolder
+            name = type(model).__name__.lower()
+            if "partcrafterdit" in name or "transformer" in name:
+                return "transformer"
+            if "conditionprocessor" in name or "condition_processor" in name:
+                return "condition_processor"
+            # fallback: use class name
+            return name
 
-                for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "transformer"))
-                    if weights:
+        def save_model_hook(models, weights, output_dir):
+            if not accelerator.is_main_process:
+                return
+            # save EMA separately
+            if args.use_ema:
+                try:
+                    ema_transformer.save_pretrained(os.path.join(output_dir, "transformer_ema"))
+                except Exception as e:
+                    logger.error(f"Failed to save EMA transformer: {e}")
+
+            # save each model to its own subfolder
+            for model in models:
+                subfolder = _subfolder_for_model(model)
+                try:
+                    model.save_pretrained(os.path.join(output_dir, subfolder))
+                except Exception as e:
+                    logger.error(f"Failed to save model {type(model).__name__} to {subfolder}: {e}")
+                if weights:
+                    # keep behavior of popping weights if present to free memory (preserve original intent)
+                    try:
                         weights.pop()
+                    except Exception:
+                        pass
 
         def load_model_hook(models, input_dir):
+            # load EMA if present
             if args.use_ema:
-                load_model = MyEMAModel.from_pretrained(os.path.join(input_dir, "transformer_ema"), PartCrafterDiTModel)
-                ema_transformer.load_state_dict(load_model.state_dict())
-                ema_transformer.to(accelerator.device)
-                del load_model
+                ema_path = os.path.join(input_dir, "transformer_ema")
+                if os.path.isdir(ema_path):
+                    try:
+                        load_model = MyEMAModel.from_pretrained(ema_path, PartCrafterDiTModel)
+                        ema_transformer.load_state_dict(load_model.state_dict())
+                        ema_transformer.to(accelerator.device)
+                        del load_model
+                    except Exception as e:
+                        logger.error(f"Failed to load EMA transformer from {ema_path}: {e}")
 
+            # load remaining models from their respective subfolders
             for _ in range(len(models)):
                 model = models.pop()
-                load_model = PartCrafterDiTModel.from_pretrained(input_dir, subfolder="transformer")
-                model.register_to_config(**load_model.config)
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                subfolder = _subfolder_for_model(model)
+                model_path = os.path.join(input_dir, subfolder)
+                if not os.path.isdir(model_path):
+                    logger.warning(f"No saved weights at {model_path} for model {type(model).__name__}; skipping.")
+                    continue
+                try:
+                    # Known type: PartCrafterDiTModel
+                    if isinstance(model, PartCrafterDiTModel) or "transformer" in subfolder:
+                        loaded = PartCrafterDiTModel.from_pretrained(model_path, subfolder=None)
+                        model.register_to_config(**loaded.config)
+                        model.load_state_dict(loaded.state_dict())
+                        del loaded
+                        continue
+
+                    # Known type: ConditionProcessor
+                    if type(model).__name__.lower().startswith("conditionprocessor") or "condition_processor" in subfolder:
+                        try:
+                            loaded = ConditionProcessor.from_pretrained(model_path, subfolder=None)
+                            # ConditionProcessor may not have register_to_config; try best-effort
+                            if hasattr(model, "register_to_config") and hasattr(loaded, "config"):
+                                model.register_to_config(**loaded.config)
+                            model.load_state_dict(loaded.state_dict())
+                            del loaded
+                            continue
+                        except Exception:
+                            # fallback to generic from_pretrained on the class if available
+                            pass
+
+                    # Generic fallback: try class.from_pretrained
+                    loaded = None
+                    if hasattr(type(model), "from_pretrained"):
+                        loaded = type(model).from_pretrained(model_path, subfolder=None)
+                    if loaded is not None:
+                        if hasattr(model, "register_to_config") and hasattr(loaded, "config"):
+                            model.register_to_config(**loaded.config)
+                        model.load_state_dict(loaded.state_dict())
+                        del loaded
+                    else:
+                        logger.warning(f"Unable to load model {type(model).__name__} from {model_path}")
+                except Exception as e:
+                    logger.error(f"Failed to load model {type(model).__name__} from {model_path}: {e}")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -515,17 +600,26 @@ def main():
     logger.info("Initializing the optimizer and learning rate scheduler...\n")
     name_lr_mult = configs["train"].get("name_lr_mult", None)
     lr_mult = configs["train"].get("lr_mult", 1.0)
-    params, params_lr_mult, names_lr_mult = [], [], []
-    for name, param in transformer.named_parameters():
-        if name_lr_mult is not None:
-            for k in name_lr_mult.split(","):
-                if k in name:
-                    params_lr_mult.append(param)
-                    names_lr_mult.append(name)
-            if name not in names_lr_mult:
+
+    def add_params_with_lr_mult(model, name_lr_mult, params, params_lr_mult, names_lr_mult):
+        for name, param in model.named_parameters():
+            if name_lr_mult is not None:
+                for k in name_lr_mult.split(","):
+                    if k in name:
+                        params_lr_mult.append(param)
+                        names_lr_mult.append(name)
+                        break  # Once it's found, no need to continue checking other keywords
+                if name not in names_lr_mult:
+                    params.append(param)
+            else:
                 params.append(param)
-        else:
-            params.append(param)
+
+    params = []
+    params_lr_mult = []
+    names_lr_mult = []
+    add_params_with_lr_mult(transformer, name_lr_mult, params, params_lr_mult, names_lr_mult)
+    add_params_with_lr_mult(condition_processor, name_lr_mult, params, params_lr_mult, names_lr_mult)
+
     optimizer = get_optimizer(
         params=[
             {"params": params, "lr": configs["optimizer"]["lr"]},
@@ -561,8 +655,9 @@ def main():
 
     vae.to(accelerator.device, dtype=weight_dtype)
     image_encoder_dinov2.to(accelerator.device, dtype=weight_dtype)
-    condition_processor.to(accelerator.device, dtype=weight_dtype)
-    if args.text_conditioning: text_encoder.to(accelerator.device, dtype=weight_dtype)
+    condition_processor.to(accelerator.device)
+    if args.text_conditioning != "none":
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     updated_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     total_updated_steps = configs["lr_scheduler"]["total_steps"]
@@ -599,7 +694,7 @@ def main():
         exp_params = save_experiment_params(args, configs, exp_dir)
         save_model_architecture(accelerator.unwrap_model(transformer), exp_dir)
 
-    if accelerator.is_main_process and not args.no_wandb:
+    if accelerator.is_main_process:
         if args.offline_wandb:
             os.environ["WANDB_MODE"] = "offline"
         wandb.init(
@@ -658,7 +753,8 @@ def main():
             negative_image_embeds = torch.zeros_like(image_embeds)
 
             # --- CORRECTED PART 2: Use the initialized tokenizer instance ---
-            if args.text_conditioning:
+            text_embeds = None
+            if args.text_conditioning != "none":
                 texts = batch["captions"]
                 with torch.no_grad():
                     text_inputs = tokenizer(
@@ -708,10 +804,6 @@ def main():
             sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
             latent_model_input = noisy_latents = (1. - sigmas) * latents + sigmas * noise
             
-            # if args.text_conditioning:
-            #     text_embeds = text_embeds.repeat_interleave(num_parts, dim=0)
-            #     negative_text_embeds = negative_text_embeds.repeat_interleave(num_parts, dim=0)
-
             if configs["train"]["cfg_dropout_prob"] > 0:
                 dropout_mask = torch.rand(num_objects, device=accelerator.device) < configs["train"]["cfg_dropout_prob"]
                 dropout_mask = dropout_mask.repeat_interleave(num_parts)
@@ -719,10 +811,12 @@ def main():
                     image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
                     if args.text_conditioning: text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
 
-            if not args.text_conditioning:
-                image_embeds = condition_processor(image=image_embeds, text=None) # this can be used for both text and image
-            else:
-                image_embeds = condition_processor(image=None, text=text_embeds)
+            # if not args.text_conditioning:
+            #     image_embeds = condition_processor(image=image_embeds, text=None) # this can be used for both text and image
+            # else:
+            #     image_embeds = condition_processor(image=None, text=text_embeds)
+            loss_contrastive, image_embeds = condition_processor(image=image_embeds, text=text_embeds, num_parts=num_parts)
+            # print(loss_contrastive)
             model_pred = transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
@@ -754,9 +848,16 @@ def main():
 
             loss = weighting * tF.mse_loss(model_pred.float(), target.float(), reduction="none")
             loss = loss.mean(dim=list(range(1, len(loss.shape))))
-            accelerator.backward(loss.mean())
+            loss = loss.mean()
+
+            # accelerator.backward(loss.mean())
+            if args.text_conditioning == "contrastive_text":
+                loss = loss*0.001 + loss_contrastive*0.999
+                # loss = loss + loss_contrastive
+            accelerator.backward(loss)
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+                all_trainable_params = list(itertools.chain(condition_processor.parameters(), transformer.parameters()))
+                accelerator.clip_grad_norm_(all_trainable_params, args.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
@@ -817,7 +918,7 @@ def main():
                 or global_update_step % configs["train"]["eval_freq"] == 0  # 2. every `eval_freq` steps
                 or global_update_step % (configs["train"]["eval_freq_epoch"] * updated_steps_per_epoch) == 0  # 3. every `eval_freq_epoch` epochs
                 or global_update_step == total_updated_steps # 4. last step of an epoch
-                or global_update_step == 1 # 5. first step
+                # or global_update_step == 1 # 5. first step
             ):  
 
                 # Use EMA parameters for evaluation
@@ -902,22 +1003,19 @@ def log_validation(
             # randomly sample the next batch
             batch = next(random_val_dataloader)
         
-        if not args.text_conditioning:
-            images = batch["images"]
-            if len(images.shape) == 5:
-                images = images[0] # (1, N, H, W, 3) -> (N, H, W, 3)
-            images = [Image.fromarray(image) for image in images.cpu().numpy()]
-            captions = None
-            N = len(images)
-        else:
-            captions = batch['captions']
-            images = None
-            N = len(captions)
+        images = batch["images"]
+        if len(images.shape) == 5:
+            images = images[0] # (1, N, H, W, 3) -> (N, H, W, 3)
+        images = [Image.fromarray(image) for image in images.cpu().numpy()]
+        N = len(images)
+        captions = batch['captions']
+        print(captions)
+        assert (args.text_conditioning == "none") or (captions is not None), "Captions are required for text conditioning"
+        if captions is not None:
+            assert len(captions) == N, f"Number of captions {len(captions)} does not match number of images {N}"
         part_surfaces = batch["part_surfaces"].cpu().numpy()
         if len(part_surfaces.shape) == 4:
             part_surfaces = part_surfaces[0] # (1, N, P, 6) -> (N, P, 6)
-
-
 
         val_progress_bar.set_postfix(
             {"num_parts": N}
@@ -943,10 +1041,8 @@ def log_validation(
                     os.makedirs(local_eval_dir, exist_ok=True)
                     rendered_images_list, rendered_normals_list = [], []
                     # 1. save the gt
-                    if not args.text_conditioning:
-                        images[0].save(os.path.join(local_eval_dir, f"{val_step:04d}.png"))
-                    else:
-                        # save the caption to a text file
+                    images[0].save(os.path.join(local_eval_dir, f"{val_step:04d}.png"))
+                    if captions is not None:
                         with open(os.path.join(local_eval_dir, f"{val_step:04d}_caption.txt"), "w") as f:
                             f.write(batch["captions"][0][0])
                     # 2. save the generated part meshes
