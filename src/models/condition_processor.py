@@ -136,7 +136,7 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             mlp_dim: int = 4096,
             projection_dim: int = 512,
             text_conditioning: str = "none",
-            shared_blocks: int = 8
+            shared_blocks: int = 2
         ):
         super().__init__()
         self.embed_dim = embed_dim

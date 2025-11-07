@@ -852,7 +852,7 @@ def main():
 
             # accelerator.backward(loss.mean())
             if args.text_conditioning == "contrastive_text":
-                loss = loss*0.001 + loss_contrastive*0.999
+                loss = loss*0.2 + loss_contrastive*0.8
                 # loss = loss + loss_contrastive
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -901,7 +901,7 @@ def main():
 
             if (
                 global_update_step % configs["train"]["save_freq"] == 0
-                or global_update_step % (configs["train"]["save_freq_epoch"] * updated_steps_per_epoch) == 0
+                # or global_update_step % (configs["train"]["save_freq_epoch"] * updated_steps_per_epoch) == 0
                 or global_update_step == total_updated_steps
             ):
                 gc.collect()
@@ -916,7 +916,7 @@ def main():
             if args.max_val_steps > 0 and (
                 (global_update_step % configs["train"]["early_eval_freq"] == 0 and global_update_step < configs["train"]["early_eval"])  # 1. more frequently at the beginning
                 or global_update_step % configs["train"]["eval_freq"] == 0  # 2. every `eval_freq` steps
-                or global_update_step % (configs["train"]["eval_freq_epoch"] * updated_steps_per_epoch) == 0  # 3. every `eval_freq_epoch` epochs
+                # or global_update_step % (configs["train"]["eval_freq_epoch"] * updated_steps_per_epoch) == 0  # 3. every `eval_freq_epoch` epochs
                 or global_update_step == total_updated_steps # 4. last step of an epoch
                 # or global_update_step == 1 # 5. first step
             ):  
