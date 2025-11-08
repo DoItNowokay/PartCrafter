@@ -107,9 +107,9 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import (
-    AdaLayerNormContinuous,
     FP32LayerNorm,
     LayerNorm,
+    RMSNorm
 )
 from diffusers.utils import (
     USE_PEFT_BACKEND,
@@ -126,6 +126,61 @@ from .modeling_outputs import Transformer1DModelOutput
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+class AdaLayerNormContinuous(nn.Module):
+    r"""
+    Adaptive normalization layer with a norm layer (layer_norm or rms_norm).
+
+    Args:
+        embedding_dim (`int`): Embedding dimension to use during projection.
+        conditioning_embedding_dim (`int`): Dimension of the input condition.
+        elementwise_affine (`bool`, defaults to `True`):
+            Boolean flag to denote if affine transformation should be applied.
+        eps (`float`, defaults to 1e-5): Epsilon factor.
+        bias (`bias`, defaults to `True`): Boolean flag to denote if bias should be use.
+        norm_type (`str`, defaults to `"layer_norm"`):
+            Normalization layer to use. Values supported: "layer_norm", "rms_norm".
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        conditioning_embedding_dim: int,
+        # NOTE: It is a bit weird that the norm layer can be configured to have scale and shift parameters
+        # because the output is immediately scaled and shifted by the projected conditioning embeddings.
+        # Note that AdaLayerNorm does not let the norm layer have scale and shift parameters.
+        # However, this is how it was implemented in the original code, and it's rather likely you should
+        # set `elementwise_affine` to False.
+        elementwise_affine=True,
+        eps=1e-5,
+        bias=True,
+        norm_type="layer_norm",
+    ):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim, eps, elementwise_affine, bias)
+        elif norm_type == "rms_norm":
+            self.norm = RMSNorm(embedding_dim, eps, elementwise_affine)
+        else:
+            raise ValueError(f"unknown norm_type {norm_type}")
+        torch.nn.init.normal_(self.linear.weight, mean=0.0, std=0.02)
+        if bias:
+            torch.nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
+        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
+        
+        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
+        if(torch.isnan(emb).any()):
+            raise ValueError("NaN value detected in conditioning embedding projection.")
+        scale, shift = torch.chunk(emb, 2, dim=1)
+        if(torch.isnan(scale).any() or torch.isnan(shift).any()):
+            raise ValueError("NaN value detected in scale or shift after chunking.")
+        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+        if(torch.isnan(x).any()):
+            raise ValueError("NaN value detected in output after normalization and scaling/shifting.")
+        return x
 
 @maybe_allow_in_graph
 class DiTBlock(nn.Module):
@@ -322,6 +377,186 @@ class DiTBlock(nn.Module):
 
         return hidden_states
 
+@maybe_allow_in_graph
+class AdaLN_DiTBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        use_self_attention: bool = True,
+        self_attention_norm_type: Optional[str] = None, 
+        use_cross_attention: bool = True, # ada layer norm
+        cross_attention_dim: Optional[int] = None,
+        cross_attention_norm_type: Optional[str] = "fp32_layer_norm",
+        dropout=0.0,
+        activation_fn: str = "gelu",
+        norm_type: str = "fp32_layer_norm",  # TODO
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = False,
+        ff_inner_dim: Optional[int] = None,  # int(dim * 4) if None
+        ff_bias: bool = True,
+        skip: bool = False,
+        skip_concat_front: bool = False,  # [x, skip] or [skip, x]
+        skip_norm_last: bool = False,  # this is an error
+        qk_norm: bool = True,
+        qkv_bias: bool = True,
+    ):
+        super().__init__()
+        self.use_self_attention = use_self_attention
+        self.use_cross_attention = use_cross_attention
+        self.skip_concat_front = skip_concat_front
+        self.skip_norm_last = skip_norm_last
+
+        # 1. Self-Attn
+        if use_self_attention:
+            # Replace FP32LayerNorm with AdaLayerNormContinuous
+            # self.norm1 = AdaLayerNormContinuous(dim, dim, norm_eps, norm_elementwise_affine)
+            # self.norm1 = AdaLayerNormContinuous(dim, dim, norm_elementwise_affine, norm_eps)
+            self.norm1 = AdaLayerNormContinuous(dim, dim)
+            self.attn1 = Attention(
+                query_dim=dim,
+                cross_attention_dim=None,
+                dim_head=dim // num_attention_heads,
+                heads=num_attention_heads,
+                qk_norm="rms_norm" if qk_norm else None,
+                eps=1e-6,
+                bias=qkv_bias,
+                processor=TripoSGAttnProcessor2_0(),
+            )
+
+        # 2. Cross-Attn
+        if use_cross_attention:
+            assert cross_attention_dim is not None
+            # Replace FP32LayerNorm with AdaLayerNormContinuous
+            self.norm2 = AdaLayerNormContinuous(dim, dim, norm_eps, norm_elementwise_affine)
+            self.attn2 = Attention(
+                query_dim=dim,
+                cross_attention_dim=cross_attention_dim,
+                dim_head=dim // num_attention_heads,
+                heads=num_attention_heads,
+                qk_norm="rms_norm" if qk_norm else None,
+                cross_attention_norm=cross_attention_norm_type,
+                eps=1e-6,
+                bias=qkv_bias,
+                processor=TripoSGAttnProcessor2_0(),
+            )
+
+        # 3. Feed-forward
+        self.norm3 = AdaLayerNormContinuous(dim, dim, norm_eps, norm_elementwise_affine)
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn, 
+            final_dropout=final_dropout,  
+            inner_dim=ff_inner_dim,  
+            bias=ff_bias,
+        )
+
+        # 4. Skip Connection
+        if skip:
+            self.skip_norm = FP32LayerNorm(dim, norm_eps, elementwise_affine=True)
+            self.skip_linear = nn.Linear(2 * dim, dim)
+        else:
+            self.skip_linear = None
+
+        self._chunk_size = None
+        self._chunk_dim = 0
+        
+    def set_topk(self, topk):
+        self.flash_processor.topk = topk
+        
+    def set_flash_processor(self, flash_processor):
+        self.flash_processor = flash_processor
+        self.attn2.processor = self.flash_processor
+
+    # Copied from diffusers.models.attention.BasicTransformerBlock.set_chunk_feed_forward
+    def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int = 0):
+        # Sets chunk feed-forward
+        self._chunk_size = chunk_size
+        self._chunk_dim = dim
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,  
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        skip: Optional[torch.Tensor] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        # Prepare attention kwargs
+        attention_kwargs = attention_kwargs or {}
+
+        # Notice that normalization is always applied before the real computation in the following blocks.
+        # 0. Long Skip Connection
+        if self.skip_linear is not None:
+            cat = torch.cat(
+                (
+                    [skip, hidden_states]
+                    if self.skip_concat_front
+                    else [hidden_states, skip]
+                ),
+                dim=-1,
+            )
+            if self.skip_norm_last:
+                # don't do this
+                hidden_states = self.skip_linear(cat)
+                hidden_states = self.skip_norm(hidden_states)
+            else:
+                cat = self.skip_norm(cat)
+                hidden_states = self.skip_linear(cat)        
+
+        
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states before attention layers.")
+        # 1. Self-Attention
+        if self.use_self_attention:
+            if torch.isnan(hidden_states).any():
+                raise ValueError("NaN value detected in hidden_states before self-attention layer.")
+            assert temb is not None, "temb should not be None when using AdaLN."
+            if torch.isnan(temb).any():
+                raise ValueError("NaN value detected in temb before self-attention layer.")
+            # print("temb:", temb)
+            # print("hidden_states:", hidden_states)
+            # print(self.norm1)
+            norm_hidden_states = self.norm1(hidden_states, temb)
+            if torch.isnan(norm_hidden_states).any():
+                raise ValueError("NaN value detected in norm_hidden_states before self-attention.")
+            attn_output = self.attn1(
+                norm_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                **attention_kwargs,
+            )
+            if torch.isnan(attn_output).any():
+                raise ValueError("NaN value detected in attn_output from self-attention.")
+            hidden_states = hidden_states + attn_output
+        
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states after self-attention layer.")
+
+        # 2. Cross-Attention
+        if self.use_cross_attention:
+            norm_hidden_states_2 = self.norm2(hidden_states, temb)
+            hidden_states = hidden_states + self.attn2(
+                norm_hidden_states_2, 
+                encoder_hidden_states=encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                **attention_kwargs,
+            )
+
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states after cross-attention layer.")
+
+        # FFN Layer
+        mlp_inputs = self.norm3(hidden_states, temb)
+        hidden_states = hidden_states + self.ff(mlp_inputs)
+
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states after feed-forward layer.")
+
+        return hidden_states
+    
 # Modified from https://github.com/VAST-AI-Research/TripoSG/blob/main/triposg/models/transformers/triposg_transformer.py#L365
 class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     """
@@ -410,7 +645,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(
+                # DiTBlock(
+                AdaLN_DiTBlock(
                     dim=self.inner_dim,
                     num_attention_heads=self.config.num_attention_heads,
                     use_self_attention=True,
@@ -623,6 +859,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hidden_states: Optional[torch.Tensor],
         timestep: Union[int, float, torch.LongTensor],
         encoder_hidden_states: Optional[torch.Tensor] = None,
+        text_pooled: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
@@ -665,14 +902,34 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         temb = self.time_embed(timestep).to(hidden_states.dtype)
         temb = self.time_proj(temb)
-        temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
+        # temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
+        if text_pooled is not None:
+            # print(text_pooled.shape)
+            # projected_text = self.adaln_text_proj(text_pooled) 
+            # # print("projected_text shape:", projected_text)
+            if torch.isnan(text_pooled).any():
+                raise ValueError("NaN value detected in projected text.")
+            if temb.shape[0] == text_pooled.shape[0]*2:
+                negative_text_pooled = torch.zeros_like(text_pooled)
+                text_pooled = torch.cat([text_pooled, negative_text_pooled], dim=0)  # (2N, D)
+            # temb = temb.float()
+            # temb = temb + 0.5 * text_pooled
+            # temb = torch.randn_like(temb) 
+            temb = temb + text_pooled
 
         hidden_states = self.proj_in(hidden_states)
+        if torch.isnan(temb).any():
+                raise ValueError("NaN value detected in temporal embedding.")
+        # print("temb stats:", temb.min(), temb.max(), temb.mean(), temb.std())
+        # if torch.isnan(temb).any() or torch.isinf(temb).any():
+        #     print("🔥 NaN or Inf detected in temb before AdaLN")
+        #     print("temb stats:", temb.min(), temb.max(), temb.mean(), temb.std())
+        #     raise ValueError("NaN or Inf detected in temb before AdaLN")
         # if encoder_hidden_states is not None:
         #     encoder_hidden_states = self.text_embed_proj(encoder_hidden_states)
 
         # T + 1 token
-        hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
+        # hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
 
         if self.enable_part_embedding:
             # Add part embedding
@@ -765,6 +1022,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
 
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states at the end of forward.")
         if not return_dict:
             return (hidden_states,)
 

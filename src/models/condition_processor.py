@@ -132,6 +132,7 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(self,
             embed_dim: int = 1024,
+            inner_dim: int = 2048,
             num_heads: int = 8,
             mlp_dim: int = 4096,
             projection_dim: int = 512,
@@ -140,6 +141,7 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
         ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.inner_dim = inner_dim
         self.text_conditioning = text_conditioning
         self.shared_blocks = int(shared_blocks)
 
@@ -152,6 +154,20 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
                 nn.ReLU(),
                 nn.Linear(self.embed_dim, self.embed_dim)
             )
+            
+        elif text_conditioning == "adaln_text":
+            self.text_feature_dim = 768  # Assuming input text features are of this dimension
+            self.text_proj = nn.Sequential(
+                nn.Linear(self.text_feature_dim, self.embed_dim),
+                nn.ReLU(),
+                nn.Linear(self.embed_dim, self.embed_dim)
+            )
+            self.adaln_text_proj = nn.Sequential(
+                nn.Linear(self.text_feature_dim, self.inner_dim),
+                nn.SiLU(),  # smoother than ReLU → less likely to explode in fp16
+                nn.Linear(self.inner_dim, self.inner_dim)
+            )
+
         elif text_conditioning == "contrastive_text":
             # 1. Learnable, modality-specific [CLS] tokens
             self.image_cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
@@ -214,6 +230,21 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             text = self.text_proj(text)
             text = text.view(B, num_tokens, self.embed_dim)
             return None, text
+        elif self.text_conditioning == "adaln_text":
+            text_pooled = text[1]   # shape [B, 768]
+            text = text[0]          # shape [B, num_tokens, 768]
+            B = text.shape[0]
+            num_tokens = text.shape[1]
+
+            text = text.view(-1, self.text_feature_dim)
+            text = self.text_proj(text)
+            text = text.view(B, num_tokens, self.embed_dim)
+
+            # project pooled text
+            projected_text_pooled = self.adaln_text_proj(text_pooled)
+
+            return None, [text, projected_text_pooled]
+
         elif self.text_conditioning == "contrastive_text":
             batch_size = image.shape[0]
             

@@ -223,7 +223,7 @@ def main():
         "--text_conditioning",
         type=str,
         default="none",
-        choices=["none", "direct_text", "contrastive_text"],
+        choices=["none", "direct_text", "contrastive_text", "adaln_text"],
         help="Whether to use text conditioning and which type"
     )
     parser.add_argument(
@@ -765,7 +765,11 @@ def main():
                         return_tensors="pt",
                     )
                     text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
-                    text_embeds = text_encoder(**text_inputs).last_hidden_state
+                    clip_output = text_encoder(**text_inputs)
+                    text_embeds = clip_output.last_hidden_state
+                    text_pooled = None
+                    if args.text_conditioning == "adaln_text":
+                        text_pooled = clip_output.pooler_output
 
                     uncond_input = tokenizer(
                         [""] * len(texts),
@@ -815,12 +819,18 @@ def main():
             #     image_embeds = condition_processor(image=image_embeds, text=None) # this can be used for both text and image
             # else:
             #     image_embeds = condition_processor(image=None, text=text_embeds)
+            if args.text_conditioning == "adaln_text":
+                text_embeds = (text_embeds, text_pooled)
             loss_contrastive, image_embeds = condition_processor(image=image_embeds, text=text_embeds, num_parts=num_parts)
+            if args.text_conditioning == "adaln_text":
+                text_pooled = image_embeds[1]
+                image_embeds = image_embeds[0] 
             # print(loss_contrastive)
             model_pred = transformer(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
                 encoder_hidden_states=image_embeds,
+                text_pooled=text_pooled if args.text_conditioning == "adaln_text" else None,
                 attention_kwargs={"num_parts": num_parts}
             ).sample
 

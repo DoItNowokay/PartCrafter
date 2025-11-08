@@ -178,9 +178,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             truncation=True
         ).to(device)
 
-        text_embeds = self.text_encoder(**text_inputs).last_hidden_state
+        
+        clip_output = self.text_encoder(**text_inputs)
+        text_embeds = clip_output.last_hidden_state
+        text_pooled = clip_output.pooler_output
         uncond_text_embeds = torch.zeros_like(text_embeds)
-        return text_embeds, uncond_text_embeds
+        return text_embeds, uncond_text_embeds, text_pooled
 
     def prepare_latents(
         self,
@@ -253,7 +256,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         image_embeds, negative_image_embeds = self.encode_image(
             image, device, num_images_per_prompt
         )
-        text_embeds, negative_text_embeds = self.encode_text(
+        text_embeds, negative_text_embeds, text_pooled = self.encode_text(
             captions, device
         )
         num_parts = torch.tensor([batch_size], device=device)
@@ -310,6 +313,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     latent_model_input,
                     timestep,
                     encoder_hidden_states=image_embeds,
+                    text_pooled=text_pooled if self.condition_processor.text_conditioning == "adaln_text" else None,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0].to(dtype)
