@@ -183,6 +183,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         text_embeds = clip_output.last_hidden_state
         text_pooled = clip_output.pooler_output
         uncond_text_embeds = torch.zeros_like(text_embeds)
+        
+        if self.condition_processor.text_conditioning != "adaln_text":
+            text_pooled = None
+
         return text_embeds, uncond_text_embeds, text_pooled
 
     def prepare_latents(
@@ -259,10 +263,17 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         text_embeds, negative_text_embeds, text_pooled = self.encode_text(
             captions, device
         )
+        if self.condition_processor.text_conditioning == "adaln_text":
+            text_embeds = (text_embeds, text_pooled)
+            
         num_parts = torch.tensor([batch_size], device=device)
         loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, num_parts=num_parts)
         loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, num_parts=num_parts)
         
+        if self.condition_processor.text_conditioning == "adaln_text":
+            text_pooled = image_embeds[1]
+            image_embeds = image_embeds[0]
+            
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
             

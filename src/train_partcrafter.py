@@ -418,6 +418,7 @@ def main():
                 configs["model"]["pretrained_model_name_or_path"],
                 "transformer"
             ),
+            text_conditioning=args.text_conditioning,
             enable_part_embedding=enable_part_embedding,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
@@ -431,6 +432,7 @@ def main():
             subfolder="transformer",
             low_cpu_mem_usage=False,
             output_loading_info=True,
+            text_conditioning=args.text_conditioning,
             enable_part_embedding=enable_part_embedding,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
@@ -450,6 +452,7 @@ def main():
             subfolder="transformer_ema",
             low_cpu_mem_usage=False,
             output_loading_info=True,
+            text_conditioning=args.text_conditioning,
             enable_part_embedding=enable_part_embedding,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,

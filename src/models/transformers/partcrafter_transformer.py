@@ -613,6 +613,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         num_layers: int = 21,
         cross_attention_dim: int = 1024,
         max_num_parts: int = 32, 
+        text_conditioning: str = "none",
         enable_part_embedding=True,
         enable_local_cross_attn: bool = True,
         enable_global_cross_attn: bool = True,
@@ -620,6 +621,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         global_attn_block_id_range: Optional[List[int]] = None,
     ):
         super().__init__()
+
+        self.text_conditioning = text_conditioning
+        
         self.out_channels = in_channels
         self.num_heads = num_attention_heads
         self.inner_dim = width
@@ -643,30 +647,55 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
 
-        self.blocks = nn.ModuleList(
-            [
-                # DiTBlock(
-                AdaLN_DiTBlock(
-                    dim=self.inner_dim,
-                    num_attention_heads=self.config.num_attention_heads,
-                    use_self_attention=True,
-                    self_attention_norm_type="fp32_layer_norm",
-                    use_cross_attention=True,
-                    cross_attention_dim=cross_attention_dim,
-                    cross_attention_norm_type=None,
-                    activation_fn="gelu",
-                    norm_type="fp32_layer_norm",  # TODO
-                    norm_eps=1e-5,
-                    ff_inner_dim=int(self.inner_dim * self.mlp_ratio),
-                    skip=layer > num_layers // 2,
-                    skip_concat_front=True,
-                    skip_norm_last=True,  # this is an error
-                    qk_norm=True,  # See http://arxiv.org/abs/2302.05442 for details.
-                    qkv_bias=False,
-                )
-                for layer in range(num_layers)
-            ]
-        )
+        if text_conditioning == "adaln_text":
+            self.blocks = nn.ModuleList(
+                [
+                    # DiTBlock(
+                    AdaLN_DiTBlock(
+                        dim=self.inner_dim,
+                        num_attention_heads=self.config.num_attention_heads,
+                        use_self_attention=True,
+                        self_attention_norm_type="fp32_layer_norm",
+                        use_cross_attention=True,
+                        cross_attention_dim=cross_attention_dim,
+                        cross_attention_norm_type=None,
+                        activation_fn="gelu",
+                        norm_type="fp32_layer_norm",  # TODO
+                        norm_eps=1e-5,
+                        ff_inner_dim=int(self.inner_dim * self.mlp_ratio),
+                        skip=layer > num_layers // 2,
+                        skip_concat_front=True,
+                        skip_norm_last=True,  # this is an error
+                        qk_norm=True,  # See http://arxiv.org/abs/2302.05442 for details.
+                        qkv_bias=False,
+                    )
+                    for layer in range(num_layers)
+                ]
+            )
+        else:
+            self.blocks = nn.ModuleList(
+                [
+                    DiTBlock(
+                        dim=self.inner_dim,
+                        num_attention_heads=self.config.num_attention_heads,
+                        use_self_attention=True,
+                        self_attention_norm_type="fp32_layer_norm",
+                        use_cross_attention=True,
+                        cross_attention_dim=cross_attention_dim,
+                        cross_attention_norm_type=None,
+                        activation_fn="gelu",
+                        norm_type="fp32_layer_norm",  # TODO
+                        norm_eps=1e-5,
+                        ff_inner_dim=int(self.inner_dim * self.mlp_ratio),
+                        skip=layer > num_layers // 2,
+                        skip_concat_front=True,
+                        skip_norm_last=True,  # this is an error
+                        qk_norm=True,  # See http://arxiv.org/abs/2302.05442 for details.
+                        qkv_bias=False,
+                    )
+                    for layer in range(num_layers)
+                ]
+            )
 
         self.norm_out = LayerNorm(self.inner_dim)
         self.proj_out = nn.Linear(self.inner_dim, self.out_channels, bias=True)
@@ -682,7 +711,6 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 global_attn_block_ids = list(range(global_attn_block_id_range[0], global_attn_block_id_range[1] + 1))
         self.global_attn_block_ids = global_attn_block_ids
 
-        # self.text_embed_proj = torch.nn.Linear(768, self.cross_attention_dim)
 
         if len(global_attn_block_ids) > 0:
             # Override self-attention processors for global attention blocks
@@ -902,34 +930,26 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         temb = self.time_embed(timestep).to(hidden_states.dtype)
         temb = self.time_proj(temb)
-        # temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
+
+        if self.text_conditioning != "adaln_text":
+            temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
+            
         if text_pooled is not None:
-            # print(text_pooled.shape)
-            # projected_text = self.adaln_text_proj(text_pooled) 
-            # # print("projected_text shape:", projected_text)
             if torch.isnan(text_pooled).any():
                 raise ValueError("NaN value detected in projected text.")
             if temb.shape[0] == text_pooled.shape[0]*2:
                 negative_text_pooled = torch.zeros_like(text_pooled)
                 text_pooled = torch.cat([text_pooled, negative_text_pooled], dim=0)  # (2N, D)
-            # temb = temb.float()
-            # temb = temb + 0.5 * text_pooled
-            # temb = torch.randn_like(temb) 
             temb = temb + text_pooled
+            if torch.isnan(temb).any():
+                    raise ValueError("NaN value detected in temporal embedding.")
 
         hidden_states = self.proj_in(hidden_states)
-        if torch.isnan(temb).any():
-                raise ValueError("NaN value detected in temporal embedding.")
-        # print("temb stats:", temb.min(), temb.max(), temb.mean(), temb.std())
-        # if torch.isnan(temb).any() or torch.isinf(temb).any():
-        #     print("🔥 NaN or Inf detected in temb before AdaLN")
-        #     print("temb stats:", temb.min(), temb.max(), temb.mean(), temb.std())
-        #     raise ValueError("NaN or Inf detected in temb before AdaLN")
-        # if encoder_hidden_states is not None:
-        #     encoder_hidden_states = self.text_embed_proj(encoder_hidden_states)
 
-        # T + 1 token
-        # hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
+
+        if self.text_conditioning != "adaln_text":
+            # T + 1 token
+            hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
 
         if self.enable_part_embedding:
             # Add part embedding
