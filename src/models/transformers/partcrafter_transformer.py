@@ -931,26 +931,28 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         temb = self.time_embed(timestep).to(hidden_states.dtype)
         temb = self.time_proj(temb)
 
-        if self.text_conditioning != "adaln_text":
-            temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
+        # if self.text_conditioning != "adaln_text":
+        #     temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
+        temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
             
-        if text_pooled is not None:
-            if torch.isnan(text_pooled).any():
-                raise ValueError("NaN value detected in projected text.")
-            if temb.shape[0] == text_pooled.shape[0]*2:
-                negative_text_pooled = torch.zeros_like(text_pooled)
-                text_pooled = torch.cat([text_pooled, negative_text_pooled], dim=0)  # (2N, D)
-            # temb = temb + text_pooled
-            temb = text_pooled
-            if torch.isnan(temb).any():
-                    raise ValueError("NaN value detected in temporal embedding.")
+        # if text_pooled is not None:
+        #     if torch.isnan(text_pooled).any():
+        #         raise ValueError("NaN value detected in projected text.")
+        #     if temb.shape[0] == text_pooled.shape[0]*2:
+        #         negative_text_pooled = torch.zeros_like(text_pooled)
+        #         text_pooled = torch.cat([text_pooled, negative_text_pooled], dim=0)  # (2N, D)
+        #     # temb = temb + text_pooled
+        #     temb = text_pooled
+        #     if torch.isnan(temb).any():
+        #             raise ValueError("NaN value detected in temporal embedding.")
 
         hidden_states = self.proj_in(hidden_states)
 
 
-        if self.text_conditioning != "adaln_text":
-            # T + 1 token
-            hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
+        # if self.text_conditioning != "adaln_text":
+        #     # T + 1 token
+        #     hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
+        hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
 
         if self.enable_part_embedding:
             # Add part embedding
@@ -1015,7 +1017,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     create_custom_forward(block),
                     hidden_states,
                     input_encoder_hidden_states,
-                    temb,
+                    text_pooled,
                     image_rotary_emb,
                     skip,
                     input_attention_kwargs,
@@ -1025,7 +1027,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=input_encoder_hidden_states,
-                    temb=temb,
+                    temb=text_pooled,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
                     attention_kwargs=input_attention_kwargs,
