@@ -137,7 +137,7 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             mlp_dim: int = 4096,
             projection_dim: int = 512,
             text_conditioning: str = "none",
-            shared_blocks: int = 2
+            shared_blocks: int = 8
         ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -231,19 +231,28 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             text = text.view(B, num_tokens, self.embed_dim)
             return None, text
         elif self.text_conditioning == "adaln_text":
-            text_pooled = text[1]   # shape [B, 768]
-            text = text[0]          # shape [B, num_tokens, 768]
-            B = text.shape[0]
-            num_tokens = text.shape[1]
+            # print(type(text))
+            if isinstance(text, tuple):
+                text_pooled = text[1]   # shape [B, 768]
+                text = text[0]          # shape [B, num_tokens, 768]
+                B = text.shape[0]
+                num_tokens = text.shape[1]
 
-            text = text.view(-1, self.text_feature_dim)
-            text = self.text_proj(text)
-            text = text.view(B, num_tokens, self.embed_dim)
+                text = text.view(-1, self.text_feature_dim)
+                text = self.text_proj(text)
+                text = text.view(B, num_tokens, self.embed_dim)
 
-            # project pooled text
-            projected_text_pooled = self.adaln_text_proj(text_pooled)
+                # project pooled text
+                projected_text_pooled = self.adaln_text_proj(text_pooled)
 
-            return None, [text, projected_text_pooled]
+                return None, [text, projected_text_pooled]
+            else:
+                B = text.shape[0]
+                num_tokens = text.shape[1]
+                text = text.view(-1, self.text_feature_dim)
+                text = self.text_proj(text)
+                text = text.view(B, num_tokens, self.embed_dim)
+                return None, text
 
         elif self.text_conditioning == "contrastive_text":
             batch_size = image.shape[0]

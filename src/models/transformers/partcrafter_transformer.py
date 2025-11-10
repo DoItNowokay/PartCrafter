@@ -940,7 +940,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             if temb.shape[0] == text_pooled.shape[0]*2:
                 negative_text_pooled = torch.zeros_like(text_pooled)
                 text_pooled = torch.cat([text_pooled, negative_text_pooled], dim=0)  # (2N, D)
-            temb = temb + text_pooled
+            # temb = temb + text_pooled
+            temb = text_pooled
             if torch.isnan(temb).any():
                     raise ValueError("NaN value detected in temporal embedding.")
 

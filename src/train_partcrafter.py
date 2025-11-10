@@ -232,11 +232,20 @@ def main():
         default=False,
         help="Whether to perform editing"
     )
+    parser.add_argument(
+        "--train_text_encoder",
+        action="store_true",
+        default=False,
+        help="Whether to train the text encoder"
+    )
 
     # Parse the arguments
     args, extras = parser.parse_known_args()
     # Parse the config file
     configs = get_configs(args.config, extras)  # change yaml configs by `extras`
+    
+    if args.train_text_encoder and args.text_conditioning == "none":
+        raise ValueError("Cannot train text encoder when no text conditioning is used.")
 
     args.val_guidance_scales = [float(x[0]) if isinstance(x, list) else float(x) for x in args.val_guidance_scales]
     if args.max_val_steps > 0:
@@ -484,8 +493,11 @@ def main():
     vae.eval()
     image_encoder_dinov2.eval()
     if args.text_conditioning != "none":
-        text_encoder.requires_grad_(False)
-        text_encoder.eval()
+        if args.train_text_encoder:
+            text_encoder.requires_grad_(True)
+        else:
+            text_encoder.requires_grad_(False)
+            text_encoder.eval()
 
     trainable_modules = configs["train"].get("trainable_modules", None)
     if trainable_modules is None:
@@ -622,6 +634,9 @@ def main():
     names_lr_mult = []
     add_params_with_lr_mult(transformer, name_lr_mult, params, params_lr_mult, names_lr_mult)
     add_params_with_lr_mult(condition_processor, name_lr_mult, params, params_lr_mult, names_lr_mult)
+    if args.text_conditioning != "none" and args.train_text_encoder:
+        logger.info("Adding text_encoder parameters to the optimizer.\n")
+        add_params_with_lr_mult(text_encoder, name_lr_mult, params, params_lr_mult, names_lr_mult)
 
     optimizer = get_optimizer(
         params=[
@@ -643,9 +658,14 @@ def main():
     if "num_warmup_steps" in configs["lr_scheduler"]:
         configs["lr_scheduler"]["num_warmup_steps"] //= accelerator.num_processes
 
-    transformer, condition_processor, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader = accelerator.prepare(
-        transformer, condition_processor, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader
-    )
+    if args.text_conditioning != "none" and args.train_text_encoder:
+        transformer, condition_processor, text_encoder, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader = accelerator.prepare(
+            transformer, condition_processor, text_encoder, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader
+        )
+    else:
+        transformer, condition_processor, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader = accelerator.prepare(
+            transformer, condition_processor, optimizer, lr_scheduler, train_loader, val_loader, random_val_loader
+        )
 
     if args.use_ema:
         ema_transformer.to(accelerator.device)
@@ -660,7 +680,10 @@ def main():
     image_encoder_dinov2.to(accelerator.device, dtype=weight_dtype)
     condition_processor.to(accelerator.device)
     if args.text_conditioning != "none":
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
+        if args.train_text_encoder:
+            text_encoder.to(accelerator.device)
+        else:
+            text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     updated_steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     total_updated_steps = configs["lr_scheduler"]["total_steps"]
@@ -744,8 +767,10 @@ def main():
 
         transformer.train()
         condition_processor.train()
+        if args.text_conditioning != "none" and args.train_text_encoder:
+            text_encoder.train()
 
-        with accelerator.accumulate(transformer, condition_processor):
+        with accelerator.accumulate(transformer, condition_processor, text_encoder if args.text_conditioning != "none" and args.train_text_encoder else None):
 
             images = batch["images"]
             with torch.no_grad():
@@ -865,11 +890,13 @@ def main():
 
             # accelerator.backward(loss.mean())
             if args.text_conditioning == "contrastive_text":
-                loss = loss*0.2 + loss_contrastive*0.8
+                loss = loss*0.5 + loss_contrastive*0.5
                 # loss = loss + loss_contrastive
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 all_trainable_params = list(itertools.chain(condition_processor.parameters(), transformer.parameters()))
+                if args.text_conditioning != "none" and args.train_text_encoder:
+                    all_trainable_params.extend(list(text_encoder.parameters()))
                 accelerator.clip_grad_norm_(all_trainable_params, args.max_grad_norm)
 
             optimizer.step()
@@ -914,7 +941,7 @@ def main():
 
             if (
                 global_update_step % configs["train"]["save_freq"] == 0
-                # or global_update_step % (configs["train"]["save_freq_epoch"] * updated_steps_per_epoch) == 0
+                or global_update_step % (configs["train"]["save_freq_epoch"] * updated_steps_per_epoch) == 0
                 or global_update_step == total_updated_steps
             ):
                 gc.collect()
@@ -929,9 +956,9 @@ def main():
             if args.max_val_steps > 0 and (
                 (global_update_step % configs["train"]["early_eval_freq"] == 0 and global_update_step < configs["train"]["early_eval"])  # 1. more frequently at the beginning
                 or global_update_step % configs["train"]["eval_freq"] == 0  # 2. every `eval_freq` steps
-                # or global_update_step % (configs["train"]["eval_freq_epoch"] * updated_steps_per_epoch) == 0  # 3. every `eval_freq_epoch` epochs
+                or global_update_step % (configs["train"]["eval_freq_epoch"] * updated_steps_per_epoch) == 0  # 3. every `eval_freq_epoch` epochs
                 or global_update_step == total_updated_steps # 4. last step of an epoch
-                # or global_update_step == 1 # 5. first step
+                or global_update_step == 1 # 5. first step
             ):  
 
                 # Use EMA parameters for evaluation
@@ -942,6 +969,8 @@ def main():
 
                 transformer.eval()
                 condition_processor.eval()
+                if args.text_conditioning != "none" and args.train_text_encoder:
+                    text_encoder.eval()
 
                 log_validation(
                     val_loader, random_val_loader,
@@ -976,6 +1005,9 @@ def log_validation(
         subfolder="scheduler"
     )
 
+    if args.text_conditioning != "none" and args.train_text_encoder:
+        text_encoder = accelerator.unwrap_model(text_encoder)
+        
     pipeline = PartCrafterPipeline(
         vae=vae,
         transformer=accelerator.unwrap_model(transformer),
