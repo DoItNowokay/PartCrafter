@@ -1,14 +1,13 @@
 model:
   # pretrained_model_name_or_path: 'pretrained_weights/PartCrafter'
   pretrained_model_name_or_path: 'pretrained_weights/TripoSG'
-  vae:
-    num_tokens: 512
-  transformer:
-    enable_local_cross_attn: true
-    global_attn_block_ids: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-    global_attn_block_id_range: null # The average should be 10 for unet-skipping
+  # vae:
+  #   num_tokens: 512
+  # transformer:
+  #   enable_local_cross_attn: true
+  #   global_attn_block_ids: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+  #   global_attn_block_id_range: null # The average should be 10 for unet-skipping
   text_encoder_name: "openai/clip-vit-large-patch14"
-  # text_encoder_name: "output_partcrafter/text_encoder_contrastive_pooled/007000"
 
 dataset:
   config: 
@@ -43,7 +42,7 @@ lr_scheduler:
   num_warmup_steps: 1000
 
 train:
-  batch_size_per_gpu: 8
+  batch_size_per_gpu: 128
   epochs: 100
   grad_checkpoint: true
   weighting_scheme: "logit_normal"

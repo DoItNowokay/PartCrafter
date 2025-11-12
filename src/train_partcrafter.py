@@ -39,7 +39,8 @@ from transformers import (
     BitImageProcessor,
     Dinov2Model,
     CLIPTextModel,
-    CLIPTokenizer
+    CLIPTokenizer,
+    CLIPConfig
 )
 from src.schedulers import RectifiedFlowScheduler
 from src.models.autoencoders import TripoSGVAEModel
@@ -223,7 +224,7 @@ def main():
         "--text_conditioning",
         type=str,
         default="none",
-        choices=["none", "direct_text", "contrastive_text", "adaln_text"],
+        choices=["none", "direct_text", "contrastive_text", "adaln_text", "contrastive_text_michelangelo", "contrastive_text_pooled"],
         help="Whether to use text conditioning and which type"
     )
     parser.add_argument(
@@ -387,17 +388,39 @@ def main():
         tokenizer = CLIPTokenizer.from_pretrained(
             configs["model"]["text_encoder_name"]
         )
-        text_encoder = CLIPTextModel.from_pretrained(
-            configs["model"]["text_encoder_name"]
-        )
+        if args.load_pretrained_model:
+            text_encoder = CLIPTextModel.from_pretrained(
+                os.path.join(
+                    args.output_dir,
+                    args.load_pretrained_model,
+                    "checkpoints",
+                    f"{args.load_pretrained_model_ckpt:06d}"
+                ),
+                subfolder="cliptextmodel"
+            )
+        else:
+            logger.info("Initialize CLIPTextModel from pretrained model\n")
+            text_encoder = CLIPTextModel.from_pretrained(
+                configs["model"]["text_encoder_name"]
+                # pretrained_model_name_or_path=os.path.join(
+                #     "output_partcrafter/text_encoder_contrastive_pooled/checkpoints/008300",
+                #     "cliptextmodel"
+                # )
+            )
     if args.load_pretrained_model:
         # condition_processor = ConditionProcessor.from_pretrained(
         #     configs["model"]["pretrained_model_name_or_path"],
         #     subfolder="condition_processor"
         # )
+        path = os.path.join(
+            args.output_dir,
+            args.load_pretrained_model,
+            "checkpoints",
+            f"{args.load_pretrained_model_ckpt:06d}"
+        )
         logger.info(f"Load pretrained ConditionProcessor to initialize from [{args.load_pretrained_model}] iteration [{args.load_pretrained_model_ckpt:06d}]\n")
         condition_processor = ConditionProcessor.from_pretrained(
-            configs["model"]["pretrained_model_name_or_path"],
+            path,
             subfolder="condition_processor",
             text_conditioning=args.text_conditioning
         )
@@ -408,6 +431,10 @@ def main():
                 configs["model"]["pretrained_model_name_or_path"],
                 "condition_processor"
             ),
+            # os.path.join(
+            #     "output_partcrafter/text_encoder_contrastive_pooled/checkpoints/008300",
+            #     "condition_processor"
+            # ),
             text_conditioning=args.text_conditioning
         )
 
@@ -521,13 +548,15 @@ def main():
                 return "transformer"
             if "conditionprocessor" in name or "condition_processor" in name:
                 return "condition_processor"
+            if "cliptextmodel" in name:
+                return "cliptextmodel"
             # fallback: use class name
             return name
 
         def save_model_hook(models, weights, output_dir):
             if not accelerator.is_main_process:
                 return
-            # save EMA separately
+            # ve EMA separately
             if args.use_ema:
                 try:
                     ema_transformer.save_pretrained(os.path.join(output_dir, "transformer_ema"))
@@ -591,6 +620,12 @@ def main():
                         except Exception:
                             # fallback to generic from_pretrained on the class if available
                             pass
+                    if type(model).__name__.lower().startswith("cliptextmodel") or "cliptextmodel" in subfolder:
+                        loaded = CLIPTextModel.from_pretrained(model_path, subfolder=None)
+                        model.register_to_config(**loaded.config)
+                        model.load_state_dict(loaded.state_dict())
+                        del loaded
+                        continue
 
                     # Generic fallback: try class.from_pretrained
                     loaded = None
@@ -777,7 +812,9 @@ def main():
                 images = feature_extractor_dinov2(images=images, return_tensors="pt").pixel_values
             images = images.to(device=accelerator.device, dtype=weight_dtype)
             with torch.no_grad():
-                image_embeds = image_encoder_dinov2(images).last_hidden_state
+                dino_output = image_encoder_dinov2(images)
+                image_embeds = dino_output.last_hidden_state
+                image_pooled = dino_output.pooler_output
             negative_image_embeds = torch.zeros_like(image_embeds)
 
             # --- CORRECTED PART 2: Use the initialized tokenizer instance ---
@@ -795,9 +832,7 @@ def main():
                     text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
                     clip_output = text_encoder(**text_inputs)
                     text_embeds = clip_output.last_hidden_state
-                    text_pooled = None
-                    if args.text_conditioning == "adaln_text":
-                        text_pooled = clip_output.pooler_output
+                    text_pooled = clip_output.pooler_output
 
                     uncond_input = tokenizer(
                         [""] * len(texts),
@@ -849,7 +884,7 @@ def main():
             #     image_embeds = condition_processor(image=None, text=text_embeds)
             if args.text_conditioning == "adaln_text":
                 text_embeds = (text_embeds, text_pooled)
-            loss_contrastive, image_embeds = condition_processor(image=image_embeds, text=text_embeds, num_parts=num_parts)
+            loss_contrastive, image_embeds = condition_processor(image=image_embeds, text=text_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts)
             if args.text_conditioning == "adaln_text":
                 text_pooled = image_embeds[1]
                 image_embeds = image_embeds[0] 
@@ -889,8 +924,8 @@ def main():
             loss = loss.mean()
 
             # accelerator.backward(loss.mean())
-            if args.text_conditioning == "contrastive_text":
-                loss = loss*0.5 + loss_contrastive*0.5
+            if "contrastive_text" in args.text_conditioning:
+                loss = loss*0.8 + loss_contrastive*0.2
                 # loss = loss + loss_contrastive
             accelerator.backward(loss)
             if accelerator.sync_gradients:

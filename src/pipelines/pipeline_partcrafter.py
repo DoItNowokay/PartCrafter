@@ -161,11 +161,13 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             image = self.feature_extractor_dinov2(image, return_tensors="pt").pixel_values
 
         image = image.to(device=device, dtype=dtype)
-        image_embeds = self.image_encoder_dinov2(image).last_hidden_state
+        dino_output = self.image_encoder_dinov2(image)
+        image_embeds = dino_output.last_hidden_state
         image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
         uncond_image_embeds = torch.zeros_like(image_embeds)
+        uncond_image_pooled = torch.zeros_like(dino_output.pooler_output)
 
-        return image_embeds, uncond_image_embeds
+        return image_embeds, uncond_image_embeds, dino_output.pooler_output, uncond_image_pooled
     
     def encode_text(self, texts, device):
         if isinstance(texts[0], list):
@@ -183,11 +185,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         text_embeds = clip_output.last_hidden_state
         text_pooled = clip_output.pooler_output
         uncond_text_embeds = torch.zeros_like(text_embeds)
+        uncond_text_pooled = torch.zeros_like(clip_output.pooler_output)
         
-        if self.condition_processor.text_conditioning != "adaln_text":
-            text_pooled = None
+        # if self.condition_processor.text_conditioning != "adaln_text":
+        #     text_pooled = None
 
-        return text_embeds, uncond_text_embeds, text_pooled
+        return text_embeds, uncond_text_embeds, text_pooled, uncond_text_pooled
 
     def prepare_latents(
         self,
@@ -257,18 +260,18 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         dtype = self.image_encoder_dinov2.dtype
         # if captions is None:
         # 3. Encode condition
-        image_embeds, negative_image_embeds = self.encode_image(
+        image_embeds, negative_image_embeds, image_pooled, negative_image_pooled = self.encode_image(
             image, device, num_images_per_prompt
         )
-        text_embeds, negative_text_embeds, text_pooled = self.encode_text(
+        text_embeds, negative_text_embeds, text_pooled, negative_text_pooled = self.encode_text(
             captions, device
         )
         if self.condition_processor.text_conditioning == "adaln_text":
             text_embeds = (text_embeds, text_pooled)
             
         num_parts = torch.tensor([batch_size], device=device)
-        loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, num_parts=num_parts)
-        loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, num_parts=num_parts)
+        loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts)
+        loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, image_pooled=negative_image_pooled, text_pooled=negative_text_pooled, num_parts=num_parts)
         
         if self.condition_processor.text_conditioning == "adaln_text":
             text_pooled = image_embeds[1]

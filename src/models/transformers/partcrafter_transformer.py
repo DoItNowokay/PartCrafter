@@ -646,12 +646,24 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.enable_part_embedding = enable_part_embedding
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
-
+        
+        if text_conditioning == "adaln_text":
+            text_pooled_dim = 2048 
+            self.conditioning_proj = nn.Linear(
+                self.inner_dim + text_pooled_dim, self.inner_dim
+            )
+            torch.nn.init.normal_(self.conditioning_proj.weight, mean=0.0, std=0.02)
+            torch.nn.init.zeros_(self.conditioning_proj.bias)
+            
+            self.pre_block_norm = AdaLayerNormContinuous(self.inner_dim, self.inner_dim)
+            
+            self.post_proj_norm = AdaLayerNormContinuous(self.out_channels, self.inner_dim)
+            
         if text_conditioning == "adaln_text":
             self.blocks = nn.ModuleList(
                 [
                     # DiTBlock(
-                    AdaLN_DiTBlock(
+                    DiTBlock(
                         dim=self.inner_dim,
                         num_attention_heads=self.config.num_attention_heads,
                         use_self_attention=True,
@@ -931,9 +943,18 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         temb = self.time_embed(timestep).to(hidden_states.dtype)
         temb = self.time_proj(temb)
 
-        # if self.text_conditioning != "adaln_text":
-        #     temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
-        temb = temb.unsqueeze(dim=1)  # unsqueeze to concat with hidden_states
+        if self.text_conditioning == "adaln_text":
+            if text_pooled is None:
+                raise ValueError("text_pooled cannot be None when text_conditioning is 'adaln_text'")
+            
+            if temb.shape[0] != text_pooled.shape[0]:
+                uncond_pooled = torch.zeros_like(text_pooled)
+                text_pooled = torch.cat([text_pooled, uncond_pooled], dim=0)
+
+            combined_cond = torch.cat([temb, text_pooled], dim=1)
+            temb = self.conditioning_proj(combined_cond)
+        else:
+            temb = temb.unsqueeze(dim=1)
             
         # if text_pooled is not None:
         #     if torch.isnan(text_pooled).any():
@@ -942,17 +963,18 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         #         negative_text_pooled = torch.zeros_like(text_pooled)
         #         text_pooled = torch.cat([text_pooled, negative_text_pooled], dim=0)  # (2N, D)
         #     # temb = temb + text_pooled
-        #     temb = text_pooled
         #     if torch.isnan(temb).any():
         #             raise ValueError("NaN value detected in temporal embedding.")
 
         hidden_states = self.proj_in(hidden_states)
 
 
-        # if self.text_conditioning != "adaln_text":
-        #     # T + 1 token
-        #     hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
-        hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
+        if self.text_conditioning != "adaln_text":
+            # T + 1 token
+            hidden_states = torch.cat([temb, hidden_states], dim=1) # (N, T+1, D)
+        else:
+            # hidden_states = torch.cat([temb.unsqueeze(dim=1), hidden_states], dim=1) # (N, T+1, D)
+            hidden_states = self.pre_block_norm(hidden_states, temb)
 
         if self.enable_part_embedding:
             # Add part embedding
@@ -1017,7 +1039,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     create_custom_forward(block),
                     hidden_states,
                     input_encoder_hidden_states,
-                    text_pooled,
+                    temb,
                     image_rotary_emb,
                     skip,
                     input_attention_kwargs,
@@ -1027,7 +1049,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=input_encoder_hidden_states,
-                    temb=text_pooled,
+                    temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
                     attention_kwargs=input_attention_kwargs,
@@ -1038,8 +1060,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         # final layer
         hidden_states = self.norm_out(hidden_states)
-        hidden_states = hidden_states[:, -T:]  # (N, T, D)
+        if self.text_conditioning != "adaln_text":
+            hidden_states = hidden_states[:, -T:]
         hidden_states = self.proj_out(hidden_states)
+        
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer

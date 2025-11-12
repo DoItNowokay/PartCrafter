@@ -212,11 +212,44 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             
             # Learnable temperature parameter
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        
+        elif text_conditioning == "contrastive_text_pooled":
+            self.text_feature_dim = 768  # Assuming input text features are of this dimension
+            self.text_proj = nn.Sequential(
+                nn.Linear(self.text_feature_dim, self.embed_dim),
+                nn.ReLU(),
+                nn.Linear(self.embed_dim, self.embed_dim)
+            )
+            self.image_projection = lambda x: x
+            self.text_projection = lambda x: x
+
+            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        
+        elif text_conditioning == "contrastive_text_michelangelo":
+            self.text_feature_dim = 768  # Assuming input text features are of this dimension
+            self.text_proj = nn.Sequential(
+                nn.Linear(self.text_feature_dim, self.embed_dim),
+                nn.ReLU(),
+                nn.Linear(self.embed_dim, self.embed_dim)
+            )
+            # self.image_projection = nn.Sequential(
+            #     nn.Linear(embed_dim, projection_dim, bias=False),
+            #     nn.ReLU(),
+            #     nn.Linear(projection_dim, projection_dim, bias=False),
+            # )
+            # self.text_projection = nn.Sequential(
+            #     nn.Linear(embed_dim, projection_dim, bias=False),
+            #     nn.ReLU(),
+            #     nn.Linear(projection_dim, projection_dim, bias=False),
+            # )
+            self.image_projection = lambda x: x
+            self.text_projection = lambda x: x
+            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         else:
             raise ValueError(f"Unknown text_conditioning: {text_conditioning}")
 
 
-    def forward(self, image: torch.Tensor, text: torch.Tensor, num_parts: torch.Tensor):
+    def forward(self, image: torch.Tensor, text: torch.Tensor, image_pooled: torch.Tensor, text_pooled: torch.Tensor, num_parts: torch.Tensor):
         """
         image_features: (B, 255, 1024) - Your encoded image patches
         text_features:  (B, 77, 1024) - Your encoded text tokens
@@ -285,6 +318,29 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             )
             
             return loss, txt_output_seq[:, 1:, :]
+        
+        elif self.text_conditioning == "contrastive_text_pooled":
+            text = self.text_proj(text) # (B, N, 1024)
+            txt_pooled = self.text_proj(text_pooled)  # (B, 1024)
+
+            image_ids = torch.arange(len(num_parts), device=image.device).repeat_interleave(num_parts)
+            loss = self.compute_contrastive_loss(
+                image_pooled, txt_pooled, image_ids, image_ids
+            )
+            return loss, text
+
+        elif self.text_conditioning == "contrastive_text_michelangelo":
+
+            text = self.text_proj(text)
+            txt_pooled = torch.mean(text, dim=1)  # (B, 1024)
+            img_pooled = torch.mean(image, dim=1)  # (B, 1024)
+
+            image_ids = torch.arange(len(num_parts), device=image.device).repeat_interleave(num_parts)
+            loss = self.compute_contrastive_loss(
+                img_pooled, txt_pooled, image_ids, image_ids
+            )
+
+            return loss, text
         else:
             raise ValueError(f"Unknown text_conditioning: {self.text_conditioning}")
     
