@@ -1,6 +1,6 @@
 model:
-  # pretrained_model_name_or_path: 'pretrained_weights/PartCrafter'
-  pretrained_model_name_or_path: 'pretrained_weights/TripoSG'
+  pretrained_model_name_or_path: 'pretrained_weights/PartCrafter'
+  # pretrained_model_name_or_path: 'pretrained_weights/TripoSG'
   vae:
     num_tokens: 512
   transformer:

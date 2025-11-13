@@ -224,7 +224,7 @@ def main():
         "--text_conditioning",
         type=str,
         default="none",
-        choices=["none", "direct_text", "contrastive_text", "adaln_text", "contrastive_text_michelangelo", "contrastive_text_pooled"],
+        choices=["none", "direct_text", "contrastive_text", "adaln_text", "contrastive_text_michelangelo", "contrastive_text_pooled", "direct_text_improved"],
         help="Whether to use text conditioning and which type"
     )
     parser.add_argument(
@@ -819,6 +819,7 @@ def main():
 
             # --- CORRECTED PART 2: Use the initialized tokenizer instance ---
             text_embeds = None
+            text_pooled = None
             if args.text_conditioning != "none":
                 texts = batch["captions"]
                 with torch.no_grad():
@@ -876,7 +877,7 @@ def main():
                 dropout_mask = dropout_mask.repeat_interleave(num_parts)
                 if dropout_mask.any():
                     image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
-                    if args.text_conditioning: text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
+                    if args.text_conditioning != "none": text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
 
             # if not args.text_conditioning:
             #     image_embeds = condition_processor(image=image_embeds, text=None) # this can be used for both text and image

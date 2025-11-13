@@ -154,7 +154,31 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
                 nn.ReLU(),
                 nn.Linear(self.embed_dim, self.embed_dim)
             )
+        elif text_conditioning == "direct_text_improved":
+            self.text_feature_dim = 768  # Assuming input text features are of this dimension
+            self.text_tokens = 77
+            # Learnable tokens that will form the new sequence
+            self.learnable_queries = nn.Parameter(torch.randn(1, self.text_tokens, self.embed_dim))
             
+            # Cross-attention layer
+            # It will attend to the CLIP tokens (K, V)
+            # using the learnable queries (Q)
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=self.embed_dim, 
+                kdim=self.text_feature_dim,  # Key dim is from CLIP
+                vdim=self.text_feature_dim,  # Value dim is from CLIP
+                num_heads=num_heads, 
+                batch_first=True
+            )
+            
+            # A standard transformer feed-forward network
+            self.ffn = nn.Sequential(
+                nn.Linear(self.embed_dim, self.embed_dim * 4),
+                nn.GELU(),
+                nn.Linear(self.embed_dim * 4, self.embed_dim)
+            )
+            self.norm1 = nn.LayerNorm(self.embed_dim)
+            self.norm2 = nn.LayerNorm(self.embed_dim)
         elif text_conditioning == "adaln_text":
             self.text_feature_dim = 768  # Assuming input text features are of this dimension
             self.text_proj = nn.Sequential(
@@ -263,6 +287,33 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             text = self.text_proj(text)
             text = text.view(B, num_tokens, self.embed_dim)
             return None, text
+        elif self.text_conditioning == "direct_text_improved":
+            # text_token_embeddings shape: (B, 77, 768)
+            
+            # Expand learnable queries to match batch size
+            # queries shape: (B, 32, 1024)
+            queries = self.learnable_queries.repeat(text.size(0), 1, 1)
+
+            # Attend to the text embeddings
+            # Q = queries
+            # K, V = text
+            attn_output, _ = self.cross_attn(
+                query=queries, 
+                key=text, 
+                value=text
+            )
+            
+            # Add & Norm (like a transformer)
+            x = self.norm1(queries + attn_output)
+            
+            # FFN
+            ffn_output = self.ffn(x)
+            
+            # Add & Norm
+            conditioning_signal = self.norm2(x + ffn_output)
+            
+            # output shape: (B, 32, 1024)
+            return None, conditioning_signal
         elif self.text_conditioning == "adaln_text":
             # print(type(text))
             if isinstance(text, tuple):
