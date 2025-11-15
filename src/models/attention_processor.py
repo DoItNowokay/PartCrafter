@@ -621,3 +621,373 @@ class PartCrafterAttnProcessor:
         hidden_states = hidden_states / attn.rescale_output_factor
 
         return hidden_states
+
+
+class PartCrafterEditAttnProcessor:
+    r"""
+    Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0). This is
+    used in the PartCrafter model. It applies a normalization layer and rotary embedding on query and key vector.
+    """
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                "AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
+            )
+
+
+    # def __call__(
+    #     self,
+    #     attn: Attention,
+    #     hidden_states: torch.Tensor,
+    #     encoder_hidden_states: Optional[torch.Tensor] = None,
+    #     attention_mask: Optional[torch.Tensor] = None,
+    #     temb: Optional[torch.Tensor] = None,
+    #     image_rotary_emb: Optional[torch.Tensor] = None,
+    #     num_parts: Optional[Union[int, torch.Tensor]] = None,
+    # ) -> torch.Tensor:
+    #     from diffusers.models.embeddings import apply_rotary_emb
+
+    #     residual = hidden_states
+    #     if attn.spatial_norm is not None:
+    #         hidden_states = attn.spatial_norm(hidden_states, temb)
+
+    #     input_ndim = hidden_states.ndim
+
+    #     if input_ndim == 4:
+    #         batch_size, channel, height, width = hidden_states.shape
+    #         hidden_states = hidden_states.view(
+    #             batch_size, channel, height * width
+    #         ).transpose(1, 2)
+
+    #     batch_size, sequence_length, _ = (
+    #         hidden_states.shape
+    #         if encoder_hidden_states is None
+    #         else encoder_hidden_states.shape
+    #     )
+
+    #     if attention_mask is not None:
+    #         attention_mask = attn.prepare_attention_mask(
+    #             attention_mask, sequence_length, batch_size
+    #         )
+    #         # scaled_dot_product_attention expects attention_mask shape to be
+    #         # (batch, heads, source_length, target_length)
+    #         attention_mask = attention_mask.view(
+    #             batch_size, attn.heads, -1, attention_mask.shape[-1]
+    #         )
+
+    #     if attn.group_norm is not None:
+    #         hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(
+    #             1, 2
+    #         )
+
+    #     query = attn.to_q(hidden_states)
+
+    #     if encoder_hidden_states is None:
+    #         encoder_hidden_states = hidden_states
+    #     elif attn.norm_cross:
+    #         encoder_hidden_states = attn.norm_encoder_hidden_states(
+    #             encoder_hidden_states
+    #         )
+    #     key = attn.to_k(encoder_hidden_states)
+    #     value = attn.to_v(encoder_hidden_states)
+
+    #     # NOTE that pre-trained models split heads first then split qkv or kv, like .view(..., attn.heads, 3, dim)
+    #     # instead of .view(..., 3, attn.heads, dim). So we need to re-split here.
+    #     if not attn.is_cross_attention:
+    #         qkv = torch.cat((query, key, value), dim=-1)
+    #         split_size = qkv.shape[-1] // attn.heads // 3
+    #         qkv = qkv.view(batch_size, -1, attn.heads, split_size * 3)
+    #         query, key, value = torch.split(qkv, split_size, dim=-1)
+    #     else:
+    #         kv = torch.cat((key, value), dim=-1)
+    #         split_size = kv.shape[-1] // attn.heads // 2
+    #         kv = kv.view(batch_size, -1, attn.heads, split_size * 2)
+    #         key, value = torch.split(kv, split_size, dim=-1)
+
+    #     head_dim = key.shape[-1]
+
+    #     query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+    #     key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+    #     value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+    #     if attn.norm_q is not None:
+    #         query = attn.norm_q(query)
+    #     if attn.norm_k is not None:
+    #         key = attn.norm_k(key)
+
+    #     # Apply RoPE if needed
+    #     if image_rotary_emb is not None:
+    #         query = apply_rotary_emb(query, image_rotary_emb)
+    #         if not attn.is_cross_attention:
+    #             key = apply_rotary_emb(key, image_rotary_emb)
+
+    #     if isinstance(num_parts, torch.Tensor):
+    #         # Assume list in training, do not consider classifier-free guidance
+    #         idx = 0
+    #         hidden_states_list = []
+    #         for n_p in num_parts:
+    #             k = key[idx : idx + n_p]
+    #             v = value[idx : idx + n_p]
+    #             q = query[idx : idx + n_p]
+    #             idx += n_p
+    #             if k.shape[2] == q.shape[2]:
+    #                 # Assuming self-attention
+    #                 # Here 'b' is always 1
+    #                 k = rearrange(
+    #                     k, "(b ni) h nt c -> b h (ni nt) c", ni=n_p
+    #                 ) # [b, h, ni*nt, c]
+    #                 v = rearrange(
+    #                     v, "(b ni) h nt c -> b h (ni nt) c", ni=n_p
+    #                 ) # [b, h, ni*nt, c]
+    #             else:
+    #                 # Assuming cross-attention
+    #                 # Here 'b' is always 1
+    #                 k = k[::n_p]     # [b, h, nt, c]
+    #                 v = v[::n_p]     # [b, h, nt, c]
+    #             # Here 'b' is always 1
+    #             q = rearrange(
+    #                 q, "(b ni) h nt c -> b h (ni nt) c", ni=n_p
+    #             ) # [b, h, ni*nt, c]
+    #             # the output of sdp = (batch, num_heads, seq_len, head_dim)
+    #             h_s = F.scaled_dot_product_attention(
+    #                 q, k, v,
+    #                 dropout_p=0.0,
+    #                 is_causal=False,
+    #             )
+    #             h_s = h_s.transpose(1, 2).reshape(
+    #                 n_p, -1, attn.heads * head_dim
+    #             )
+    #             h_s = h_s.to(query.dtype)
+    #             hidden_states_list.append(h_s)
+    #         hidden_states = torch.cat(hidden_states_list, dim=0)
+
+    #     elif isinstance(num_parts, int):
+    #         # Assume single instance
+    #         if key.shape[2] == query.shape[2]:
+    #             # Assuming self-attention
+    #             # Here we need 'b' when using classifier-free guidance
+    #             key = rearrange(
+    #                 key, "(b ni) h nt c -> b h (ni nt) c", ni=num_parts
+    #             ) # [b, h, ni*nt, c]
+    #             value = rearrange(
+    #                 value, "(b ni) h nt c -> b h (ni nt) c", ni=num_parts
+    #             ) # [b, h, ni*nt, c]
+    #         else:
+    #             # Assuming cross-attention
+    #             # Here we need 'b' when using classifier-free guidance
+    #             # Control signal is repeated ni times within each (b, ni)
+    #             # We select only the first instance per group
+    #             key = key[::num_parts]     # [b, h, nt, c]
+    #             value = value[::num_parts] # [b, h, nt, c]
+    #         query = rearrange(
+    #             query, "(b ni) h nt c -> b h (ni nt) c", ni=num_parts
+    #         ) # [b, h, ni*nt, c]
+
+    #         # the output of sdp = (batch, num_heads, seq_len, head_dim)
+    #         hidden_states = F.scaled_dot_product_attention(
+    #             query,
+    #             key,
+    #             value,
+    #             dropout_p=0.0,
+    #             is_causal=False,
+    #         )
+    #         hidden_states = hidden_states.transpose(1, 2).reshape(
+    #             batch_size, -1, attn.heads * head_dim
+    #         )
+    #         hidden_states = hidden_states.to(query.dtype)
+
+    #     else:
+    #         raise ValueError(
+    #             "num_parts must be a torch.Tensor or int, but got {}".format(type(num_parts))
+    #         )
+        
+    #     # linear proj
+    #     hidden_states = attn.to_out[0](hidden_states)
+    #     # dropout
+    #     hidden_states = attn.to_out[1](hidden_states)
+
+    #     if input_ndim == 4:
+    #         hidden_states = hidden_states.transpose(-1, -2).reshape(
+    #             batch_size, channel, height, width
+    #         )
+
+    #     if attn.residual_connection:
+    #         hidden_states = hidden_states + residual
+
+    #     hidden_states = hidden_states / attn.rescale_output_factor
+
+    #     return hidden_states
+    def __call__(
+    self,
+    attn: Attention,
+    hidden_states: torch.FloatTensor,
+    encoder_hidden_states: Optional[torch.FloatTensor] = None,
+    attention_mask: Optional[torch.FloatTensor] = None,
+    temb: Optional[torch.FloatTensor] = None,
+    scale: float = 1.0,
+    attention_kwargs=None,
+) -> torch.FloatTensor:
+        import torch.nn.functional as F
+
+        # Keep original residual
+        residual = hidden_states
+
+        # Keep original spatial norm if present
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+
+        # If conv-like 4D input, flatten spatial dims into sequence
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+        else:
+            batch_size = hidden_states.shape[0]
+
+        # Determine sequence length from encoder if provided (mirrors your original)
+        batch_size_enc, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        # prepare attention mask if any (leave most logic to attn.prepare_attention_mask if available)
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            # If group_norm expects a specific mask reshape it earlier (your code had a variant)
+            if attn.group_norm is not None:
+                attention_mask = attention_mask.reshape(batch_size, -1)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        # Project QKV
+        query = attn.to_q(hidden_states)
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        # Compute head dim and reshape into (batch_total_parts, heads, seq_len_per_part, head_dim)
+        head_dim = query.shape[-1] // attn.heads
+        # query/key/value original shape: (batch_total_parts, seq_len, heads*head_dim)
+        query = query.view(-1, query.shape[1], attn.heads, head_dim).transpose(1, 2)   # (B*M, heads, nt, head_dim)
+        key = key.view(-1, key.shape[1], attn.heads, head_dim).transpose(1, 2)
+        value = value.view(-1, value.shape[1], attn.heads, head_dim).transpose(1, 2)
+
+        # Optional q/k normalization (commented in your snippet)
+        if hasattr(attn, "norm_q") and attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if hasattr(attn, "norm_k") and attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        # Local attention: run scaled dot-product attention on the full (B*M, heads, seq_len, head_dim)
+        # Output shape: (B*M, heads, seq_len, head_dim)
+        attn_output_local = F.scaled_dot_product_attention(
+            query, key, value, dropout_p=0.0, is_causal=False
+        )
+
+        # If no attention_kwargs or no grouping info, fallback to local-only
+        if attention_kwargs is None or "num_parts" not in attention_kwargs:
+            attn_output = attn_output_local
+        else:
+            num_parts = attention_kwargs["num_parts"]
+            if not isinstance(num_parts, torch.Tensor):
+                raise ValueError(f"num_parts must be a torch.Tensor of shape [B], got {type(num_parts)}")
+
+            # num_objects = B (number of groups / objects)
+            num_objects = int(num_parts.shape[0])
+
+            total_parts_in_batch = query.shape[0]  # B*M (the flattened batch dimension)
+            if total_parts_in_batch % num_objects != 0:
+                raise ValueError(
+                    f"Total parts ({total_parts_in_batch}) not divisible by num_objects ({num_objects})"
+                )
+            max_parts = total_parts_in_batch // num_objects  # M
+
+            # Build mask_flat: which parts are valid (True) vs padded (False)
+            if "part_mask" in attention_kwargs:
+                part_mask = attention_kwargs["part_mask"]
+                # expect shape [B, M]
+                if part_mask.shape[0] != num_objects or part_mask.shape[1] != max_parts:
+                    raise ValueError(
+                        f"part_mask shape mismatch. Got {part_mask.shape} but expected [{num_objects}, {max_parts}]"
+                    )
+                mask_flat = part_mask.view(-1)  # (B*M,)
+            else:
+                # Construct mask from num_parts
+                indices = torch.arange(max_parts, device=num_parts.device).unsqueeze(0)  # (1, M)
+                mask = indices < num_parts.unsqueeze(1)  # (B, M)
+                mask_flat = mask.view(-1)  # (B*M,)
+
+            # Object/group index per flattened part: [0..0,1..1,2..2,...] repeated M times
+            obj_indices = torch.arange(num_objects, device=query.device).repeat_interleave(max_parts)  # (B*M,)
+            # Mark padded positions with -1
+            obj_indices = torch.where(mask_flat.to(obj_indices.dtype), obj_indices, torch.full_like(obj_indices, -1))
+
+            # Prepare empty tensors for group-pooled Q/K/V: shape (B, heads, seq_len, head_dim)
+            heads = query.shape[1]
+            seq_per_part = query.shape[2]
+            q_global = torch.zeros((num_objects, heads, seq_per_part, head_dim), device=query.device, dtype=query.dtype)
+            k_global = torch.zeros_like(q_global)
+            v_global = torch.zeros_like(q_global)
+
+            # Only collect from valid positions
+            valid_mask = obj_indices >= 0
+            if valid_mask.any():
+                src_q = query[valid_mask]  # (sum_valid, heads, nt, head_dim)
+                src_k = key[valid_mask]
+                src_v = value[valid_mask]
+                tgt_idx = obj_indices[valid_mask].long()  # (sum_valid,)
+
+                # expand tgt_idx so it can be used by scatter_add along dim=0
+                # scatter_add_ expects index tensor shaped like the target; we expand to match src shape
+                idx_expanded = tgt_idx.view(-1, 1, 1, 1).expand(-1, heads, seq_per_part, head_dim)
+                q_global.scatter_add_(0, idx_expanded, src_q)
+                k_global.scatter_add_(0, idx_expanded, src_k)
+                v_global.scatter_add_(0, idx_expanded, src_v)
+
+            # Normalize by the number of parts per object (avoid div by zero)
+            num_parts_float = num_parts.to(dtype=q_global.dtype).view(num_objects, 1, 1, 1)
+            num_parts_float = num_parts_float.clamp(min=1.0)  # safety
+            q_global = q_global / num_parts_float
+            k_global = k_global / num_parts_float
+            v_global = v_global / num_parts_float
+
+            # Global attention per object: (B, heads, nt, head_dim) -> same shape
+            attn_output_global = F.scaled_dot_product_attention(
+                q_global, k_global, v_global, dropout_p=0.0, is_causal=False
+            )
+
+            # Scatter global outputs back to per-part positions
+            attn_output_part = torch.zeros_like(attn_output_local)  # (B*M, heads, nt, head_dim)
+            if valid_mask.any():
+                # select global outputs for each valid part and assign
+                selected_global = attn_output_global[tgt_idx]  # (sum_valid, heads, nt, head_dim)
+                attn_output_part[valid_mask] = selected_global
+
+            # Combine local and global contributions
+            attn_output = attn_output_local + attn_output_part
+
+        # Restore to (batch_total_parts, seq_len, heads*head_dim)
+        attn_output = attn_output.transpose(1, 2).reshape(-1, sequence_length, attn.heads * head_dim)
+
+        # Map back through linear out and dropout (same as original)
+        attn_output = attn.to_out[0](attn_output)
+        attn_output = attn.to_out[1](attn_output)
+
+        # If input was 4D, restore shape
+        if input_ndim == 4:
+            attn_output = attn_output.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            attn_output = attn_output + residual
+
+        attn_output = attn_output / attn.rescale_output_factor
+
+        return attn_output
+

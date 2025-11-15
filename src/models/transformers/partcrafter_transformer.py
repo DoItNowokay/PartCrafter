@@ -121,7 +121,7 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from torch import nn
 
-from ..attention_processor import FusedTripoSGAttnProcessor2_0, TripoSGAttnProcessor2_0, PartCrafterAttnProcessor
+from ..attention_processor import FusedTripoSGAttnProcessor2_0, TripoSGAttnProcessor2_0, PartCrafterAttnProcessor, PartCrafterEditAttnProcessor
 from .modeling_outputs import Transformer1DModelOutput
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -220,6 +220,7 @@ class DiTBlock(nn.Module):
         dim: int,
         num_attention_heads: int,
         use_self_attention: bool = True,
+        editing: Optional[str] = None,
         self_attention_norm_type: Optional[str] = None, 
         use_cross_attention: bool = True, # ada layer norm
         cross_attention_dim: Optional[int] = None,
@@ -239,7 +240,7 @@ class DiTBlock(nn.Module):
         qkv_bias: bool = True,
     ):
         super().__init__()
-
+        self.editing = editing
         self.use_self_attention = use_self_attention
         self.use_cross_attention = use_cross_attention
         self.skip_concat_front = skip_concat_front
@@ -285,6 +286,19 @@ class DiTBlock(nn.Module):
                 processor=TripoSGAttnProcessor2_0(),
             )
 
+        if self.editing == "cross_attn_editing":
+            self.norm_edit = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
+            self.attn_edit = Attention(
+                query_dim=dim,
+                cross_attention_dim=dim, # We will project the source latent to 'dim'
+                dim_head=dim // num_attention_heads,
+                heads=num_attention_heads,
+                qk_norm="rms_norm" if qk_norm else None,
+                cross_attention_norm=cross_attention_norm_type,
+                eps=1e-6,
+                bias=qkv_bias,
+                processor=TripoSGAttnProcessor2_0(),
+            )
         # 3. Feed-forward
         self.norm3 = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
@@ -326,6 +340,7 @@ class DiTBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
+        source_hidden_states: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         skip: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -371,189 +386,16 @@ class DiTBlock(nn.Module):
                 **attention_kwargs,
             )
 
+        if self.use_cross_attention and source_hidden_states is not None:
+            hidden_states = hidden_states + self.attn_edit(
+                self.norm_edit(hidden_states),
+                encoder_hidden_states=source_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                **attention_kwargs,
+            )
         # FFN Layer ### TODO: switch norm2 and norm3 in the state dict
         mlp_inputs = self.norm3(hidden_states)
         hidden_states = hidden_states + self.ff(mlp_inputs)
-
-        return hidden_states
-
-@maybe_allow_in_graph
-class AdaLN_DiTBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_attention_heads: int,
-        use_self_attention: bool = True,
-        self_attention_norm_type: Optional[str] = None, 
-        use_cross_attention: bool = True, # ada layer norm
-        cross_attention_dim: Optional[int] = None,
-        cross_attention_norm_type: Optional[str] = "fp32_layer_norm",
-        dropout=0.0,
-        activation_fn: str = "gelu",
-        norm_type: str = "fp32_layer_norm",  # TODO
-        norm_elementwise_affine: bool = True,
-        norm_eps: float = 1e-5,
-        final_dropout: bool = False,
-        ff_inner_dim: Optional[int] = None,  # int(dim * 4) if None
-        ff_bias: bool = True,
-        skip: bool = False,
-        skip_concat_front: bool = False,  # [x, skip] or [skip, x]
-        skip_norm_last: bool = False,  # this is an error
-        qk_norm: bool = True,
-        qkv_bias: bool = True,
-    ):
-        super().__init__()
-        self.use_self_attention = use_self_attention
-        self.use_cross_attention = use_cross_attention
-        self.skip_concat_front = skip_concat_front
-        self.skip_norm_last = skip_norm_last
-
-        # 1. Self-Attn
-        if use_self_attention:
-            # Replace FP32LayerNorm with AdaLayerNormContinuous
-            # self.norm1 = AdaLayerNormContinuous(dim, dim, norm_eps, norm_elementwise_affine)
-            # self.norm1 = AdaLayerNormContinuous(dim, dim, norm_elementwise_affine, norm_eps)
-            self.norm1 = AdaLayerNormContinuous(dim, dim)
-            self.attn1 = Attention(
-                query_dim=dim,
-                cross_attention_dim=None,
-                dim_head=dim // num_attention_heads,
-                heads=num_attention_heads,
-                qk_norm="rms_norm" if qk_norm else None,
-                eps=1e-6,
-                bias=qkv_bias,
-                processor=TripoSGAttnProcessor2_0(),
-            )
-
-        # 2. Cross-Attn
-        if use_cross_attention:
-            assert cross_attention_dim is not None
-            # Replace FP32LayerNorm with AdaLayerNormContinuous
-            self.norm2 = AdaLayerNormContinuous(dim, dim, norm_eps, norm_elementwise_affine)
-            self.attn2 = Attention(
-                query_dim=dim,
-                cross_attention_dim=cross_attention_dim,
-                dim_head=dim // num_attention_heads,
-                heads=num_attention_heads,
-                qk_norm="rms_norm" if qk_norm else None,
-                cross_attention_norm=cross_attention_norm_type,
-                eps=1e-6,
-                bias=qkv_bias,
-                processor=TripoSGAttnProcessor2_0(),
-            )
-
-        # 3. Feed-forward
-        self.norm3 = AdaLayerNormContinuous(dim, dim, norm_eps, norm_elementwise_affine)
-        self.ff = FeedForward(
-            dim,
-            dropout=dropout,
-            activation_fn=activation_fn, 
-            final_dropout=final_dropout,  
-            inner_dim=ff_inner_dim,  
-            bias=ff_bias,
-        )
-
-        # 4. Skip Connection
-        if skip:
-            self.skip_norm = FP32LayerNorm(dim, norm_eps, elementwise_affine=True)
-            self.skip_linear = nn.Linear(2 * dim, dim)
-        else:
-            self.skip_linear = None
-
-        self._chunk_size = None
-        self._chunk_dim = 0
-        
-    def set_topk(self, topk):
-        self.flash_processor.topk = topk
-        
-    def set_flash_processor(self, flash_processor):
-        self.flash_processor = flash_processor
-        self.attn2.processor = self.flash_processor
-
-    # Copied from diffusers.models.attention.BasicTransformerBlock.set_chunk_feed_forward
-    def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int = 0):
-        # Sets chunk feed-forward
-        self._chunk_size = chunk_size
-        self._chunk_dim = dim
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        temb: Optional[torch.Tensor] = None,  
-        image_rotary_emb: Optional[torch.Tensor] = None,
-        skip: Optional[torch.Tensor] = None,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> torch.Tensor:
-        # Prepare attention kwargs
-        attention_kwargs = attention_kwargs or {}
-
-        # Notice that normalization is always applied before the real computation in the following blocks.
-        # 0. Long Skip Connection
-        if self.skip_linear is not None:
-            cat = torch.cat(
-                (
-                    [skip, hidden_states]
-                    if self.skip_concat_front
-                    else [hidden_states, skip]
-                ),
-                dim=-1,
-            )
-            if self.skip_norm_last:
-                # don't do this
-                hidden_states = self.skip_linear(cat)
-                hidden_states = self.skip_norm(hidden_states)
-            else:
-                cat = self.skip_norm(cat)
-                hidden_states = self.skip_linear(cat)        
-
-        
-        if torch.isnan(hidden_states).any():
-            raise ValueError("NaN value detected in hidden_states before attention layers.")
-        # 1. Self-Attention
-        if self.use_self_attention:
-            if torch.isnan(hidden_states).any():
-                raise ValueError("NaN value detected in hidden_states before self-attention layer.")
-            assert temb is not None, "temb should not be None when using AdaLN."
-            if torch.isnan(temb).any():
-                raise ValueError("NaN value detected in temb before self-attention layer.")
-            # print("temb:", temb)
-            # print("hidden_states:", hidden_states)
-            # print(self.norm1)
-            norm_hidden_states = self.norm1(hidden_states, temb)
-            if torch.isnan(norm_hidden_states).any():
-                raise ValueError("NaN value detected in norm_hidden_states before self-attention.")
-            attn_output = self.attn1(
-                norm_hidden_states,
-                image_rotary_emb=image_rotary_emb,
-                **attention_kwargs,
-            )
-            if torch.isnan(attn_output).any():
-                raise ValueError("NaN value detected in attn_output from self-attention.")
-            hidden_states = hidden_states + attn_output
-        
-        if torch.isnan(hidden_states).any():
-            raise ValueError("NaN value detected in hidden_states after self-attention layer.")
-
-        # 2. Cross-Attention
-        if self.use_cross_attention:
-            norm_hidden_states_2 = self.norm2(hidden_states, temb)
-            hidden_states = hidden_states + self.attn2(
-                norm_hidden_states_2, 
-                encoder_hidden_states=encoder_hidden_states,
-                image_rotary_emb=image_rotary_emb,
-                **attention_kwargs,
-            )
-
-        if torch.isnan(hidden_states).any():
-            raise ValueError("NaN value detected in hidden_states after cross-attention layer.")
-
-        # FFN Layer
-        mlp_inputs = self.norm3(hidden_states, temb)
-        hidden_states = hidden_states + self.ff(mlp_inputs)
-
-        if torch.isnan(hidden_states).any():
-            raise ValueError("NaN value detected in hidden_states after feed-forward layer.")
 
         return hidden_states
     
@@ -614,6 +456,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         cross_attention_dim: int = 1024,
         max_num_parts: int = 32, 
         text_conditioning: str = "none",
+        editing: str = "none",
         enable_part_embedding=True,
         enable_local_cross_attn: bool = True,
         enable_global_cross_attn: bool = True,
@@ -623,6 +466,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         super().__init__()
 
         self.text_conditioning = text_conditioning
+        self.editing = editing
         
         self.out_channels = in_channels
         self.num_heads = num_attention_heads
@@ -646,6 +490,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.enable_part_embedding = enable_part_embedding
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
+        if self.editing == "cross_attn_editing":
+            self.source_proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
         
         if text_conditioning == "adaln_text":
             text_pooled_dim = 2048 
@@ -667,6 +513,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         dim=self.inner_dim,
                         num_attention_heads=self.config.num_attention_heads,
                         use_self_attention=True,
+                        editing=self.editing,
                         self_attention_norm_type="fp32_layer_norm",
                         use_cross_attention=True,
                         cross_attention_dim=cross_attention_dim,
@@ -691,6 +538,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         dim=self.inner_dim,
                         num_attention_heads=self.config.num_attention_heads,
                         use_self_attention=True,
+                        editing=self.editing,
                         self_attention_norm_type="fp32_layer_norm",
                         use_cross_attention=True,
                         cross_attention_dim=cross_attention_dim,
@@ -724,7 +572,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.global_attn_block_ids = global_attn_block_ids
 
 
-        if len(global_attn_block_ids) > 0:
+        if len(global_attn_block_ids) > 0 and not self.editing:
             # Override self-attention processors for global attention blocks
             attn_processor_dict = {}
             modified_attn_processor = []
@@ -738,6 +586,38 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = TripoSGAttnProcessor2_0()
             self.set_attn_processor(attn_processor_dict)
             # logger.info(f"Modified {modified_attn_processor} to PartCrafterAttnProcessor")
+        if len(global_attn_block_ids) > 0 and self.editing == "cross_attn_editing":
+            attn_processor_dict = {}
+            modified_attn_processor = []
+
+            for layer_id in range(num_layers):
+
+                # 1. attn1 (Self-Attention)
+                processor_key_1 = f'blocks.{layer_id}.attn1.processor'
+                if layer_id in global_attn_block_ids:
+                    # Use special processor for global self-attention
+                    attn_processor_dict[processor_key_1] = PartCrafterEditAttnProcessor()
+                    modified_attn_processor.append(processor_key_1)
+                else:
+                    # Use standard processor for local self-attention
+                    attn_processor_dict[processor_key_1] = TripoSGAttnProcessor2_0()
+
+                # 2. attn2 (Text Cross-Attention)
+                # MUST ALWAYS be the standard processor
+                processor_key_2 = f'blocks.{layer_id}.attn2.processor'
+                attn_processor_dict[processor_key_2] = TripoSGAttnProcessor2_0()
+
+                # 3. attn_source (Source 3D Cross-Attention)
+                # MUST ALWAYS be the standard processor
+                # We add it unconditionally because DiTBlock always has it
+                if hasattr(self.blocks[layer_id], "attn_edit"):
+                    processor_key_source = f'blocks.{layer_id}.attn_edit.processor'
+                    attn_processor_dict[processor_key_source] = TripoSGAttnProcessor2_0()
+
+            logger.info(f"Applying special PartCrafterAttnProcessor to: {modified_attn_processor}")
+
+            # This will now pass a dict of size 63
+            self.set_attn_processor(attn_processor_dict)
 
     def _set_gradient_checkpointing(
         self, 
@@ -899,10 +779,12 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hidden_states: Optional[torch.Tensor],
         timestep: Union[int, float, torch.LongTensor],
         encoder_hidden_states: Optional[torch.Tensor] = None,
+        source_hidden_states: Optional[torch.Tensor] = None,
         text_pooled: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
+        
     ):
         """
         The [`HunyuanDiT2DModel`] forward method.
@@ -967,6 +849,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         #             raise ValueError("NaN value detected in temporal embedding.")
 
         hidden_states = self.proj_in(hidden_states)
+        
+        if self.editing == "cross_attn_editing" and source_hidden_states is not None:
+            # Project from [B, 31, C] -> [B, 31, D]
+            source_hidden_states = self.source_proj_in(source_hidden_states)
 
 
         if self.text_conditioning != "adaln_text":
@@ -976,7 +862,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # hidden_states = torch.cat([temb.unsqueeze(dim=1), hidden_states], dim=1) # (N, T+1, D)
             hidden_states = self.pre_block_norm(hidden_states, temb)
 
-        if self.enable_part_embedding:
+        if self.enable_part_embedding and not self.editing:
             # Add part embedding
             num_parts = attention_kwargs["num_parts"]
             if isinstance(num_parts, torch.Tensor):
@@ -992,6 +878,37 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     "num_parts must be a torch.Tensor or int, but got {}".format(type(num_parts))
                 )
             hidden_states = hidden_states + part_embedding.unsqueeze(dim=1) # (N, T+1, D)
+            
+        if self.enable_part_embedding and self.editing == "cross_attn_editing": 
+            print("Editing mode with part embedding enabled.")           
+            num_parts = attention_kwargs["num_parts"] 
+            if not isinstance(num_parts, torch.Tensor):
+                raise ValueError(f"num_parts must be a Tensor, but got {type(num_parts)}")
+
+            num_objects = num_parts.shape[0]
+            
+            total_parts_in_batch = hidden_states.shape[0]
+            
+            if total_parts_in_batch % num_objects != 0:
+                raise ValueError(
+                    f"Total batch size ({total_parts_in_batch}) is not divisible by "
+                    f"num_objects ({num_objects}). Your dataloader is creating jagged batches."
+                )
+            max_parts = total_parts_in_batch // num_objects
+            
+            part_indices = torch.arange(max_parts, device=hidden_states.device).repeat(num_objects)
+            
+            part_embedding = self.part_embedding(part_indices)
+            
+            
+            if "part_mask" not in attention_kwargs:
+                raise ValueError("part_mask is required in attention_kwargs for editing mode.")
+            part_mask = attention_kwargs["part_mask"]
+            mask_flat = part_mask.view(-1, 1).to(part_embedding.dtype)
+        
+            part_embedding = part_embedding * mask_flat # Shape [64, D]
+
+            hidden_states = hidden_states + part_embedding.unsqueeze(dim=1)
 
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
@@ -1040,6 +957,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     hidden_states,
                     input_encoder_hidden_states,
                     temb,
+                    source_hidden_states,
                     image_rotary_emb,
                     skip,
                     input_attention_kwargs,
@@ -1050,6 +968,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     hidden_states,
                     encoder_hidden_states=input_encoder_hidden_states,
                     temb=temb,
+                    source_hidden_states=source_hidden_states,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
                     attention_kwargs=input_attention_kwargs,

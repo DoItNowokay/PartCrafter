@@ -1,6 +1,6 @@
 model:
-  pretrained_model_name_or_path: 'pretrained_weights/PartCrafter'
-  # pretrained_model_name_or_path: 'pretrained_weights/TripoSG'
+  # pretrained_model_name_or_path: 'pretrained_weights/PartCrafter'
+  pretrained_model_name_or_path: 'pretrained_weights/TripoSG'
   vae:
     num_tokens: 512
   transformer:
@@ -13,12 +13,12 @@ model:
 dataset:
   config: 
     # - 'datasets/object_part_configs.json' # Modify this path if you use your own dataset
-    - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/object_part_configs.json'
+    # - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/object_part_configs.json'
     # - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/object_part_configs.json'
-    #  - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/chair/object_part_configs.json'
+     - 'preprocessed_data/shapenet/chair/object_part_configs.json'
     #  - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/table/object_part_configs.json'
     #  - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/scissors/object_part_configs.json'
-  caps3d_csv_path: 'preprocessed_data/Cap3D_automated_Objaverse_full.csv'
+  shapetalk_csv_path: 'preprocessed_data/shapetalk.csv'
   training_ratio: 0.9
   min_num_parts: 1
   max_num_parts: 8
@@ -44,7 +44,7 @@ lr_scheduler:
 
 train:
   batch_size_per_gpu: 8
-  epochs: 100
+  epochs: 300
   grad_checkpoint: true
   weighting_scheme: "logit_normal"
   logit_mean: 0.0
@@ -76,7 +76,7 @@ val:
   batch_size_per_gpu: 1
   nrow: 4
   min_num_parts: 2
-  max_num_parts: 8
+  max_num_parts: 16
   num_inference_steps: 50
   max_num_expanded_coords: 1e8
   use_flash_decoder: false
