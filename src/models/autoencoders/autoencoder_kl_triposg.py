@@ -415,7 +415,6 @@ class TripoSGVAEModel(ModelMixin, ConfigMixin):
             x.shape[1], num_tokens * 4, replace=num_tokens * 4 > x.shape[1]
         )
         selected_points = x[:, indices]
-
         batch_size, num_points, num_channels = selected_points.shape
         flattened_points = selected_points.view(batch_size * num_points, num_channels)
         batch_indices = (

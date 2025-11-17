@@ -119,6 +119,67 @@ class SharedTransformerBlock(nn.Module):
         
         return x_final
 
+class LatentEditingBlock(nn.Module):
+    """
+    Modifies DINOv2 image embeddings based on CLIP text embeddings.
+    This is effectively a Transformer Decoder layer.
+    """
+    def __init__(self, embed_dim=1024, num_heads=8):
+        super().__init__()
+        self.embed_dim = embed_dim
+        
+        # Layer norms
+        self.norm_image = nn.LayerNorm(embed_dim)
+        self.norm_text = nn.LayerNorm(embed_dim)
+        self.norm_ffn = nn.LayerNorm(embed_dim)
+
+        # The core of the module: Cross-Attention
+        # The image embeddings (Q) "attend to" the text embeddings (K, V)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            batch_first=True  # Expects (B, N, D)
+        )
+        
+        # Standard Feed-Forward Network
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+
+    def forward(self, image_embeds, text_embeds_projected):
+        # image_embeds: (B, 257, 1024)
+        # text_embeds_projected: (B, 77, 1024)
+        
+        # 1. Normalize the image embeddings (Query)
+        image_normed = self.norm_image(image_embeds)
+        
+        # 2. Normalize the text embeddings (Key, Value)
+        text_normed = self.norm_text(text_embeds_projected)
+        
+        # 3. Cross-Attention
+        # Each of the 257 image tokens will "look at" the 77 text tokens
+        # to find relevant editing information.
+        attn_output, _ = self.cross_attn(
+            query=image_normed,           # (B, 257, 1024)
+            key=text_normed,              # (B, 77, 1024)
+            value=text_normed             # (B, 77, 1024)
+        )
+        
+        # 4. First Residual Connection (Add the text info)
+        # This is the "delta" you were talking about
+        x = image_embeds + attn_output
+        
+        # 5. Feed-Forward Network (to process the new info)
+        ffn_output = self.ffn(self.norm_ffn(x))
+        
+        # 6. Second Residual Connection
+        modified_image_embeds = x + ffn_output
+        
+        # output: (B, 257, 1024) - same shape as input!
+        return modified_image_embeds
+
 
 class ConditionProcessor(ModelMixin, ConfigMixin):
     """
@@ -137,25 +198,26 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             mlp_dim: int = 4096,
             projection_dim: int = 512,
             text_conditioning: str = "none",
+            editing: str = "none",
             shared_blocks: int = 8
         ):
         super().__init__()
         self.embed_dim = embed_dim
         self.inner_dim = inner_dim
         self.text_conditioning = text_conditioning
+        self.editing = editing
         self.shared_blocks = int(shared_blocks)
+        self.text_feature_dim = 768  # Assuming input text features are of this dimension
 
         if text_conditioning == "none":
-            return
+            pass
         elif text_conditioning == "direct_text":
-            self.text_feature_dim = 768  # Assuming input text features are of this dimension
             self.text_proj = nn.Sequential(
                 nn.Linear(self.text_feature_dim, self.embed_dim),
                 nn.ReLU(),
                 nn.Linear(self.embed_dim, self.embed_dim)
             )
         elif text_conditioning == "direct_text_improved":
-            self.text_feature_dim = 768  # Assuming input text features are of this dimension
             self.text_tokens = 77
             # Learnable tokens that will form the new sequence
             self.learnable_queries = nn.Parameter(torch.randn(1, self.text_tokens, self.embed_dim))
@@ -180,7 +242,6 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             self.norm1 = nn.LayerNorm(self.embed_dim)
             self.norm2 = nn.LayerNorm(self.embed_dim)
         elif text_conditioning == "adaln_text":
-            self.text_feature_dim = 768  # Assuming input text features are of this dimension
             self.text_proj = nn.Sequential(
                 nn.Linear(self.text_feature_dim, self.embed_dim),
                 nn.ReLU(),
@@ -198,7 +259,6 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             self.text_cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
             
             # 2. text_projector to match embed_dim if needed
-            self.text_feature_dim = 768  # Assuming input text features are of this dimension
             self.text_proj = nn.Sequential(
                 nn.Linear(self.text_feature_dim, self.embed_dim),
                 nn.ReLU(),
@@ -238,7 +298,6 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         
         elif text_conditioning == "contrastive_text_pooled":
-            self.text_feature_dim = 768  # Assuming input text features are of this dimension
             self.text_proj = nn.Sequential(
                 nn.Linear(self.text_feature_dim, self.embed_dim),
                 nn.ReLU(),
@@ -250,7 +309,6 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         
         elif text_conditioning == "contrastive_text_michelangelo":
-            self.text_feature_dim = 768  # Assuming input text features are of this dimension
             self.text_proj = nn.Sequential(
                 nn.Linear(self.text_feature_dim, self.embed_dim),
                 nn.ReLU(),
@@ -272,21 +330,84 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
         else:
             raise ValueError(f"Unknown text_conditioning: {text_conditioning}")
 
+        if editing == "none":
+            pass
+        elif editing == "direct_tweak_latent":
+            self.editing_module = nn.ModuleList([])
+            for _ in range(self.shared_blocks):
+                self.editing_module.append(
+                    LatentEditingBlock(
+                        embed_dim=self.embed_dim,
+                        num_heads=num_heads
+                    )
+                )
+        elif editing == "l1_tweak_latent":
+            self.editing_module = nn.ModuleList([])
+            for _ in range(self.shared_blocks):
+                self.editing_module.append(
+                    LatentEditingBlock(
+                        embed_dim=self.embed_dim,
+                        num_heads=num_heads
+                    )
+                )
+            
+        elif editing == "text_cross_attn":
+            pass
+        elif editing == "source_cross_attn":
+            pass
+        else:
+            raise ValueError(f"Unknown editing: {editing}")
 
-    def forward(self, image: torch.Tensor, text: torch.Tensor, image_pooled: torch.Tensor, text_pooled: torch.Tensor, num_parts: torch.Tensor):
+        self.apply(self._init_weight)
+
+    # --- [NEW] INITIALIZATION FUNCTION ---
+    def _init_weight(self, m):
+        """
+        Applies Xavier uniform initialization to Linear layers and
+        resets LayerNorm layers to default.
+        """
+        if isinstance(m, nn.Linear):
+            # Apply Xavier uniform initialization to the weight
+            torch.nn.init.xavier_uniform_(m.weight)
+            # Initialize the bias to zero, if it exists
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+        
+        elif isinstance(m, nn.LayerNorm):
+            # Reset LayerNorm to its default init (weight=1, bias=0)
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                torch.nn.init.constant_(m.weight, 1.0)
+
+    def forward(self,
+                image: torch.Tensor,
+                text: torch.Tensor,
+                image_pooled: torch.Tensor,
+                text_pooled: torch.Tensor,
+                num_parts: torch.Tensor,
+                target_image_embed: torch.Tensor = None
+        ):
         """
         image_features: (B, 255, 1024) - Your encoded image patches
         text_features:  (B, 77, 1024) - Your encoded text tokens
         """
+        loss = None
+        combined_feats = None
         if self.text_conditioning == "none":
-            return None, image
-        elif self.text_conditioning == "direct_text":
+            loss = None
+            combined_feats = text
+        elif self.text_conditioning == "direct_text" and self.editing != "text_cross_attn":
             B = text.shape[0]
             num_tokens = text.shape[1]
             text = text.view(-1, self.text_feature_dim)
             text = self.text_proj(text)
             text = text.view(B, num_tokens, self.embed_dim)
-            return None, text
+            # return None, text
+            loss = None
+            combined_feats = text
+        elif self.text_conditioning == "direct_text" and self.editing == "text_cross_attn":
+            pass
         elif self.text_conditioning == "direct_text_improved":
             # text_token_embeddings shape: (B, 77, 768)
             
@@ -313,7 +434,10 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             conditioning_signal = self.norm2(x + ffn_output)
             
             # output shape: (B, 32, 1024)
-            return None, conditioning_signal
+            # return None, conditioning_signal
+            # text = conditioning_signal
+            loss = None
+            combined_feats = conditioning_signal
         elif self.text_conditioning == "adaln_text":
             # print(type(text))
             if isinstance(text, tuple):
@@ -329,14 +453,19 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
                 # project pooled text
                 projected_text_pooled = self.adaln_text_proj(text_pooled)
 
-                return None, [text, projected_text_pooled]
+                # return None, [text, projected_text_pooled]
+                # text = [text, projected_text_pooled]
+                loss = None
+                combined_feats = [text, projected_text_pooled]
             else:
                 B = text.shape[0]
                 num_tokens = text.shape[1]
                 text = text.view(-1, self.text_feature_dim)
                 text = self.text_proj(text)
                 text = text.view(B, num_tokens, self.embed_dim)
-                return None, text
+                # return None, text
+                loss = None
+                combined_feats = text
 
         elif self.text_conditioning == "contrastive_text":
             batch_size = image.shape[0]
@@ -367,8 +496,10 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             loss = self.compute_contrastive_loss(
                 img_pooled, txt_pooled, image_ids, image_ids
             )
-            
-            return loss, txt_output_seq[:, 1:, :]
+            # return loss, txt_output_seq[:, 1:, :]
+            # text = txt_output_seq[:, 1:, :]
+            loss = None
+            combined_feats = txt_output_seq[:, 1:, :]
         
         elif self.text_conditioning == "contrastive_text_pooled":
             text = self.text_proj(text) # (B, N, 1024)
@@ -378,10 +509,11 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             loss = self.compute_contrastive_loss(
                 image_pooled, txt_pooled, image_ids, image_ids
             )
-            return loss, text
+            # return loss, text
+            loss = None
+            combined_feats = text
 
         elif self.text_conditioning == "contrastive_text_michelangelo":
-
             text = self.text_proj(text)
             txt_pooled = torch.mean(text, dim=1)  # (B, 1024)
             img_pooled = torch.mean(image, dim=1)  # (B, 1024)
@@ -390,10 +522,39 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             loss = self.compute_contrastive_loss(
                 img_pooled, txt_pooled, image_ids, image_ids
             )
-
-            return loss, text
+            # return loss, text
+            loss = None
+            combined_feats = text
         else:
             raise ValueError(f"Unknown text_conditioning: {self.text_conditioning}")
+        
+        if self.editing == "none":
+            pass
+        elif self.editing == "direct_tweak_latent":
+            # Apply each LatentEditingBlock sequentially
+            for edit_block in self.editing_module:
+                image = edit_block(image, text)
+            combined_feats = image
+        elif self.editing == "l1_tweak_latent":
+            # Apply each LatentEditingBlock sequentially
+            for edit_block in self.editing_module:
+                image = edit_block(image, text)
+            combined_feats = image
+            # L1 loss is often more stable and robust than L2 (MSE) for latents
+            l1_loss_latent = F.l1_loss(combined_feats, target_image_embed)
+            if loss is not None:
+                loss = loss + l1_loss_latent*0.25
+            else:
+                loss = l1_loss_latent*0.25
+        elif self.editing == "text_cross_attn":
+            loss = None
+            combined_feats = [text, image]
+        elif self.editing == "source_cross_attn":
+            pass
+        else:
+            raise ValueError(f"Unknown editing: {self.editing}")
+
+        return loss, combined_feats
     
     def compute_contrastive_loss(self, 
                                 img_pooled: torch.Tensor, 

@@ -25,6 +25,7 @@ from transformers import (
     BitImageProcessor,
     Dinov2Model,
 )
+from src.models.condition_processor import ConditionProcessor
 
 @torch.no_grad()
 def run_triposg(
@@ -109,13 +110,16 @@ if __name__ == "__main__":
         
         # Load your custom transformer
         transformer = PartCrafterDiTModel.from_pretrained(args.custom_trns)
-
+        
+        condition_processor = ConditionProcessor.from_pretrained('output_partcrafter/direct_text_improved_mp8_nt512_partcrafter_TCS_ema/checkpoints/002100/condition_processor')
+        condition_processor.text_conditioning = "none"  # Disable text conditioning
         scheduler = RectifiedFlowScheduler.from_pretrained(partcrafter_weights_dir, subfolder="scheduler")
         image_encoder_dinov2 = Dinov2Model.from_pretrained(partcrafter_weights_dir, subfolder="image_encoder_dinov2")
         feature_extractor_dinov2 = BitImageProcessor.from_pretrained(partcrafter_weights_dir, subfolder="feature_extractor_dinov2")
 
         pipe: PartCrafterPipeline = PartCrafterPipeline(
             vae=vae,
+            condition_processor=condition_processor,
             transformer=transformer,
             scheduler=scheduler,
             image_encoder_dinov2=image_encoder_dinov2,

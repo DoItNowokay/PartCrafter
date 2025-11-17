@@ -224,6 +224,7 @@ class DiTBlock(nn.Module):
         self_attention_norm_type: Optional[str] = None, 
         use_cross_attention: bool = True, # ada layer norm
         cross_attention_dim: Optional[int] = None,
+        text_cross_attention_dim: Optional[int] = None,
         cross_attention_norm_type: Optional[str] = "fp32_layer_norm",
         dropout=0.0,
         activation_fn: str = "gelu",
@@ -285,20 +286,37 @@ class DiTBlock(nn.Module):
                 bias=qkv_bias,
                 processor=TripoSGAttnProcessor2_0(),
             )
+            if editing == "text_cross_attn":
+                self.norm_text = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
+                self.attn_text = Attention(
+                    query_dim=dim,
+                    cross_attention_dim=text_cross_attention_dim,
+                    dim_head=dim // num_attention_heads,
+                    heads=num_attention_heads,
+                    qk_norm="rms_norm" if qk_norm else None,
+                    cross_attention_norm=cross_attention_norm_type,
+                    eps=1e-6,
+                    bias=qkv_bias,
+                    processor=TripoSGAttnProcessor2_0(),
+                )
+                torch.nn.init.zeros_(self.attn_text.to_out[0].weight)
+                torch.nn.init.zeros_(self.attn_text.to_out[0].bias)
 
-        if self.editing == "cross_attn_editing":
-            self.norm_edit = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
-            self.attn_edit = Attention(
-                query_dim=dim,
-                cross_attention_dim=dim, # We will project the source latent to 'dim'
-                dim_head=dim // num_attention_heads,
-                heads=num_attention_heads,
-                qk_norm="rms_norm" if qk_norm else None,
-                cross_attention_norm=cross_attention_norm_type,
-                eps=1e-6,
-                bias=qkv_bias,
-                processor=TripoSGAttnProcessor2_0(),
-            )
+            if self.editing == "source_cross_attn":
+                self.norm_edit = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
+                self.attn_edit = Attention(
+                    query_dim=dim,
+                    cross_attention_dim=dim, # We will project the source latent to 'dim'
+                    dim_head=dim // num_attention_heads,
+                    heads=num_attention_heads,
+                    qk_norm="rms_norm" if qk_norm else None,
+                    cross_attention_norm=cross_attention_norm_type,
+                    eps=1e-6,
+                    bias=qkv_bias,
+                    processor=TripoSGAttnProcessor2_0(),
+                )
+                torch.nn.init.normal_(self.attn_edit.to_out[0].weight, mean=0.0, std=0.02)
+                torch.nn.init.zeros_(self.attn_edit.to_out[0].bias)
         # 3. Feed-forward
         self.norm3 = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
@@ -339,6 +357,7 @@ class DiTBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
+        text_encoder_hidden_states: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
         source_hidden_states: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
@@ -350,6 +369,8 @@ class DiTBlock(nn.Module):
 
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Long Skip Connection
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states at the beginning of DiTBlock.")
         if self.skip_linear is not None:
             cat = torch.cat(
                 (
@@ -377,6 +398,10 @@ class DiTBlock(nn.Module):
             )
             hidden_states = hidden_states + attn_output
 
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states after self-attention in DiTBlock.")
+        
+        
         # 2. Cross-Attention
         if self.use_cross_attention:
             hidden_states = hidden_states + self.attn2(
@@ -385,17 +410,33 @@ class DiTBlock(nn.Module):
                 image_rotary_emb=image_rotary_emb,
                 **attention_kwargs,
             )
+            if self.editing == "text_cross_attn":
+                hidden_states = hidden_states + self.attn_text(
+                    self.norm_text(hidden_states),
+                    encoder_hidden_states=text_encoder_hidden_states,
+                    **attention_kwargs,
+                )
+            if self.editing == "source_cross_attn":
+                hidden_states = hidden_states + self.attn_edit(
+                    self.norm_edit(hidden_states),
+                    encoder_hidden_states=source_hidden_states,
+                    image_rotary_emb=image_rotary_emb,
+                    **attention_kwargs,
+                )
+        
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states after cross-attention in DiTBlock.")
 
-        if self.use_cross_attention and source_hidden_states is not None:
-            hidden_states = hidden_states + self.attn_edit(
-                self.norm_edit(hidden_states),
-                encoder_hidden_states=source_hidden_states,
-                image_rotary_emb=image_rotary_emb,
-                **attention_kwargs,
-            )
+            
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states after editing cross-attention in DiTBlock.")
+        
         # FFN Layer ### TODO: switch norm2 and norm3 in the state dict
         mlp_inputs = self.norm3(hidden_states)
         hidden_states = hidden_states + self.ff(mlp_inputs)
+        
+        if torch.isnan(hidden_states).any():
+            raise ValueError("NaN value detected in hidden_states after feed-forward in DiTBlock.")
 
         return hidden_states
     
@@ -490,8 +531,11 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.enable_part_embedding = enable_part_embedding
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
-        if self.editing == "cross_attn_editing":
+        if self.editing == "source_cross_attn":
             self.source_proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
+            torch.nn.init.zeros_(self.source_proj_in.weight)
+            torch.nn.init.zeros_(self.source_proj_in.bias)
+    
         
         if text_conditioning == "adaln_text":
             text_pooled_dim = 2048 
@@ -542,6 +586,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         self_attention_norm_type="fp32_layer_norm",
                         use_cross_attention=True,
                         cross_attention_dim=cross_attention_dim,
+                        text_cross_attention_dim=768,
                         cross_attention_norm_type=None,
                         activation_fn="gelu",
                         norm_type="fp32_layer_norm",  # TODO
@@ -586,38 +631,38 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = TripoSGAttnProcessor2_0()
             self.set_attn_processor(attn_processor_dict)
             # logger.info(f"Modified {modified_attn_processor} to PartCrafterAttnProcessor")
-        if len(global_attn_block_ids) > 0 and self.editing == "cross_attn_editing":
-            attn_processor_dict = {}
-            modified_attn_processor = []
+        # if len(global_attn_block_ids) > 0 and self.editing == "source_cross_attn":
+        #     attn_processor_dict = {}
+        #     modified_attn_processor = []
 
-            for layer_id in range(num_layers):
+        #     for layer_id in range(num_layers):
 
-                # 1. attn1 (Self-Attention)
-                processor_key_1 = f'blocks.{layer_id}.attn1.processor'
-                if layer_id in global_attn_block_ids:
-                    # Use special processor for global self-attention
-                    attn_processor_dict[processor_key_1] = PartCrafterEditAttnProcessor()
-                    modified_attn_processor.append(processor_key_1)
-                else:
-                    # Use standard processor for local self-attention
-                    attn_processor_dict[processor_key_1] = TripoSGAttnProcessor2_0()
+        #         # 1. attn1 (Self-Attention)
+        #         processor_key_1 = f'blocks.{layer_id}.attn1.processor'
+        #         if layer_id in global_attn_block_ids:
+        #             # Use special processor for global self-attention
+        #             attn_processor_dict[processor_key_1] = PartCrafterEditAttnProcessor()
+        #             modified_attn_processor.append(processor_key_1)
+        #         else:
+        #             # Use standard processor for local self-attention
+        #             attn_processor_dict[processor_key_1] = TripoSGAttnProcessor2_0()
 
-                # 2. attn2 (Text Cross-Attention)
-                # MUST ALWAYS be the standard processor
-                processor_key_2 = f'blocks.{layer_id}.attn2.processor'
-                attn_processor_dict[processor_key_2] = TripoSGAttnProcessor2_0()
+        #         # 2. attn2 (Text Cross-Attention)
+        #         # MUST ALWAYS be the standard processor
+        #         processor_key_2 = f'blocks.{layer_id}.attn2.processor'
+        #         attn_processor_dict[processor_key_2] = TripoSGAttnProcessor2_0()
 
-                # 3. attn_source (Source 3D Cross-Attention)
-                # MUST ALWAYS be the standard processor
-                # We add it unconditionally because DiTBlock always has it
-                if hasattr(self.blocks[layer_id], "attn_edit"):
-                    processor_key_source = f'blocks.{layer_id}.attn_edit.processor'
-                    attn_processor_dict[processor_key_source] = TripoSGAttnProcessor2_0()
+        #         # 3. attn_source (Source 3D Cross-Attention)
+        #         # MUST ALWAYS be the standard processor
+        #         # We add it unconditionally because DiTBlock always has it
+        #         if hasattr(self.blocks[layer_id], "attn_edit"):
+        #             processor_key_source = f'blocks.{layer_id}.attn_edit.processor'
+        #             attn_processor_dict[processor_key_source] = TripoSGAttnProcessor2_0()
 
-            logger.info(f"Applying special PartCrafterAttnProcessor to: {modified_attn_processor}")
+        #     logger.info(f"Applying special PartCrafterAttnProcessor to: {modified_attn_processor}")
 
-            # This will now pass a dict of size 63
-            self.set_attn_processor(attn_processor_dict)
+        #     # This will now pass a dict of size 63
+        #     self.set_attn_processor(attn_processor_dict)
 
     def _set_gradient_checkpointing(
         self, 
@@ -779,6 +824,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         hidden_states: Optional[torch.Tensor],
         timestep: Union[int, float, torch.LongTensor],
         encoder_hidden_states: Optional[torch.Tensor] = None,
+        text_hidden_states: Optional[torch.Tensor] = None,
         source_hidden_states: Optional[torch.Tensor] = None,
         text_pooled: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -850,9 +896,17 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         hidden_states = self.proj_in(hidden_states)
         
-        if self.editing == "cross_attn_editing" and source_hidden_states is not None:
-            # Project from [B, 31, C] -> [B, 31, D]
+        if self.editing == "source_cross_attn" and source_hidden_states is not None:
+            negative_source_hidden_states = None
+            if isinstance(source_hidden_states, list):
+                negative_source_hidden_states = source_hidden_states[0]
+                source_hidden_states = source_hidden_states[1]
             source_hidden_states = self.source_proj_in(source_hidden_states)
+            if negative_source_hidden_states is not None:
+                negative_source_hidden_states = self.source_proj_in(negative_source_hidden_states)
+                source_hidden_states = torch.cat([source_hidden_states, negative_source_hidden_states], dim=0)
+            if torch.isnan(source_hidden_states).any():
+                raise ValueError("NaN value detected in projected source hidden states.")
 
 
         if self.text_conditioning != "adaln_text":
@@ -862,7 +916,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             # hidden_states = torch.cat([temb.unsqueeze(dim=1), hidden_states], dim=1) # (N, T+1, D)
             hidden_states = self.pre_block_norm(hidden_states, temb)
 
-        if self.enable_part_embedding and not self.editing:
+        if self.enable_part_embedding:
             # Add part embedding
             num_parts = attention_kwargs["num_parts"]
             if isinstance(num_parts, torch.Tensor):
@@ -878,40 +932,13 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     "num_parts must be a torch.Tensor or int, but got {}".format(type(num_parts))
                 )
             hidden_states = hidden_states + part_embedding.unsqueeze(dim=1) # (N, T+1, D)
-            
-        if self.enable_part_embedding and self.editing == "cross_attn_editing": 
-            print("Editing mode with part embedding enabled.")           
-            num_parts = attention_kwargs["num_parts"] 
-            if not isinstance(num_parts, torch.Tensor):
-                raise ValueError(f"num_parts must be a Tensor, but got {type(num_parts)}")
 
-            num_objects = num_parts.shape[0]
-            
-            total_parts_in_batch = hidden_states.shape[0]
-            
-            if total_parts_in_batch % num_objects != 0:
-                raise ValueError(
-                    f"Total batch size ({total_parts_in_batch}) is not divisible by "
-                    f"num_objects ({num_objects}). Your dataloader is creating jagged batches."
-                )
-            max_parts = total_parts_in_batch // num_objects
-            
-            part_indices = torch.arange(max_parts, device=hidden_states.device).repeat(num_objects)
-            
-            part_embedding = self.part_embedding(part_indices)
-            
-            
-            if "part_mask" not in attention_kwargs:
-                raise ValueError("part_mask is required in attention_kwargs for editing mode.")
-            part_mask = attention_kwargs["part_mask"]
-            mask_flat = part_mask.view(-1, 1).to(part_embedding.dtype)
-        
-            part_embedding = part_embedding * mask_flat # Shape [64, D]
-
-            hidden_states = hidden_states + part_embedding.unsqueeze(dim=1)
-
+        if torch.isnan(hidden_states).any():
+                raise ValueError("NaN value detected in hidden_states after adding part embedding.")
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
+        negative_text_hidden_states = torch.zeros_like(text_hidden_states) if text_hidden_states is not None else None
+        negative_source_hidden_states = torch.zeros_like(source_hidden_states) if source_hidden_states is not None else None
 
         skips = []
         for layer, block in enumerate(self.blocks):
@@ -924,6 +951,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 # If in non-global attention block and disable local cross attention, use negative encoder_hidden_states
                 # Do not inject control signal into non-global attention block
                 input_encoder_hidden_states = negative_encoder_hidden_states
+                input_text_hidden_states = negative_text_hidden_states
+                input_source_hidden_states = negative_source_hidden_states
             elif (
                 (not self.enable_global_cross_attn)
                 and len(self.global_attn_block_ids) > 0
@@ -932,8 +961,12 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 # If in global attention block and disable global cross attention, use negative encoder_hidden_states
                 # Do not inject control signal into global attention block
                 input_encoder_hidden_states = negative_encoder_hidden_states
+                input_text_hidden_states = negative_text_hidden_states
+                input_source_hidden_states = negative_source_hidden_states
             else:
                 input_encoder_hidden_states = encoder_hidden_states
+                input_text_hidden_states = text_hidden_states
+                input_source_hidden_states = source_hidden_states
             
             if len(self.global_attn_block_ids) > 0 and (layer in self.global_attn_block_ids):
                 # Inject control signal into global attention block
@@ -956,8 +989,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     create_custom_forward(block),
                     hidden_states,
                     input_encoder_hidden_states,
+                    input_text_hidden_states,
                     temb,
-                    source_hidden_states,
+                    input_source_hidden_states,
                     image_rotary_emb,
                     skip,
                     input_attention_kwargs,
@@ -967,8 +1001,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=input_encoder_hidden_states,
+                    text_encoder_hidden_states=input_text_hidden_states,
+                    source_hidden_states=input_source_hidden_states,
                     temb=temb,
-                    source_hidden_states=source_hidden_states,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
                     attention_kwargs=input_attention_kwargs,

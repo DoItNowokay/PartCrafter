@@ -42,7 +42,6 @@ def preprocess(args):
     processed_folders = {f for f in os.listdir(output_path) if os.path.isdir(os.path.join(output_path, f))}
     processed_meshes_base = {folder for folder in processed_folders}
     meshes_to_process = {mesh for mesh in source_meshes if mesh.replace('.glb', '') not in processed_meshes_base}
-
     if args['limit'] == -1:
         meshes_to_process = list(meshes_to_process)
     else:

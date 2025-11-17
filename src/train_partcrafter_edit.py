@@ -54,8 +54,10 @@ from src.datasets import (
     ObjaverseCaptionDataset,
     BatchedObjaverseCaptionDataset,
     MultiEpochsDataLoader,
-    ShapeNetEditingDataset,
-    EditingCollator,
+    ShapeNetImageEditing,
+    BatchedShapeNetImageEditing,
+    ShapeNetLatentEditing,
+    BatchedShapeNetLatentEditing,
     yield_forever
 )
 from src.utils.data_utils import get_colored_mesh_composition
@@ -233,7 +235,7 @@ def main():
         "--editing",
         type=str,
         default="none",
-        choices=["none", "cross_attn_editing"],
+        choices=["none", "source_cross_attn", "direct_tweak_latent", "l1_tweak_latent", "text_cross_attn"],
         help="Whether to perform editing"
     )
     parser.add_argument(
@@ -316,50 +318,82 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         
     train_loader = None
-    if args.editing:
-        if not args.text_conditioning:
-            raise ValueError("Editing requires --text_conditioning to be enabled.")
+    if args.editing == "source_cross_attn":
+        logger.info("Using Source Cross-Attention Editing Dataloader")
 
-        logger.info("Using Object-Level Editing Dataloader (abandoning part-packing)")
-
-        train_dataset = ShapeNetEditingDataset(
+        train_dataset = BatchedShapeNetLatentEditing(
             configs=configs,
+            batch_size=configs["train"]["batch_size_per_gpu"],
+            is_main_process=accelerator.is_main_process,
+            shuffle=True,
             training=True,
         )
-        val_dataset = ShapeNetEditingDataset(
+        val_dataset = ShapeNetLatentEditing(
             configs=configs,
             training=False,
         )
-
-        # Get max_parts from config (make sure it's in your YAML)
-        # This MUST match the model's `max_num_parts`
-        max_parts = configs["dataset"].get("max_num_parts", 32)
-        collator = EditingCollator(max_num_parts=max_parts)
-
         train_loader = MultiEpochsDataLoader(
             train_dataset,
-            batch_size=configs["train"]["batch_size_per_gpu"], # This is now OBJECTS per GPU
+            batch_size=configs["train"]["batch_size_per_gpu"],
             num_workers=args.num_workers,
-            shuffle=True, # Shuffle in DataLoader
             drop_last=True,
             pin_memory=args.pin_memory,
-            collate_fn=collator, # Use the new collator
+            collate_fn=train_dataset.collate_fn,
         )
         val_loader = MultiEpochsDataLoader(
             val_dataset,
-            batch_size=configs["val"]["batch_size_per_gpu"], # This is now OBJECTS per GPU
+            batch_size=configs["val"]["batch_size_per_gpu"],
             num_workers=args.num_workers,
             drop_last=True,
             pin_memory=args.pin_memory,
-            collate_fn=collator, # Use the new collator
         )
         random_val_loader = MultiEpochsDataLoader(
             val_dataset,
             batch_size=configs["val"]["batch_size_per_gpu"],
             shuffle=True,
             num_workers=args.num_workers,
-        drop_last=True,
-            collate_fn=collator,
+            drop_last=True,
+            pin_memory=args.pin_memory,
+        )
+    elif args.editing != "none":
+        if not args.text_conditioning:
+            raise ValueError("Editing requires --text_conditioning to be enabled.")
+
+        logger.info("Using Object-Level Editing Dataloader ")
+
+        train_dataset = BatchedShapeNetImageEditing(
+            configs=configs,
+            batch_size=configs["train"]["batch_size_per_gpu"],
+            is_main_process=accelerator.is_main_process,
+            shuffle=True,
+            training=True,
+        )
+        val_dataset = ShapeNetImageEditing(
+            configs=configs,
+            training=False,
+        )
+        train_loader = MultiEpochsDataLoader(
+            train_dataset,
+            batch_size=configs["train"]["batch_size_per_gpu"],
+            num_workers=args.num_workers,
+            drop_last=True,
+            pin_memory=args.pin_memory,
+            collate_fn=train_dataset.collate_fn,
+        )
+        val_loader = MultiEpochsDataLoader(
+            val_dataset,
+            batch_size=configs["val"]["batch_size_per_gpu"],
+            num_workers=args.num_workers,
+            drop_last=True,
+            pin_memory=args.pin_memory,
+        )
+        random_val_loader = MultiEpochsDataLoader(
+            val_dataset,
+            batch_size=configs["val"]["batch_size_per_gpu"],
+            shuffle=True,
+            num_workers=args.num_workers,
+            drop_last=True,
+            pin_memory=args.pin_memory,
         )
     elif args.text_conditioning:
         train_dataset = BatchedObjaverseCaptionDataset(
@@ -504,10 +538,11 @@ def main():
                 "condition_processor"
             ),
             # os.path.join(
-            #     "output_partcrafter/text_encoder_contrastive_pooled/checkpoints/008300",
+            #     "output_partcrafter/l1_tweak_latent_pretrained/checkpoints/005100",
             #     "condition_processor"
             # ),
-            text_conditioning=args.text_conditioning
+            text_conditioning=args.text_conditioning,
+            editing = args.editing,
         )
 
     enable_part_embedding = configs["model"]["transformer"].get("enable_part_embedding", True)
@@ -527,7 +562,7 @@ def main():
                 "transformer"
             ),
             text_conditioning=args.text_conditioning,
-            editing = args.editing,
+            editing=args.editing,
             enable_part_embedding=enable_part_embedding,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
@@ -542,7 +577,7 @@ def main():
             low_cpu_mem_usage=False,
             output_loading_info=True,
             text_conditioning=args.text_conditioning,
-            editing =args.editing,
+            editing=args.editing,
             enable_part_embedding=enable_part_embedding,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
@@ -563,7 +598,7 @@ def main():
             low_cpu_mem_usage=False,
             output_loading_info=True,
             text_conditioning=args.text_conditioning,
-            editing =args.editing,
+            editing=args.editing,
             enable_part_embedding=enable_part_embedding,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
@@ -722,21 +757,21 @@ def main():
     if configs["train"]["grad_checkpoint"]:
         transformer.enable_gradient_checkpointing()
         
-    if args.editing=="cross_attn_editing" and args.resume_from_iter is None:
-        logger.info("Freezing pre-trained weights for stable adapter-tuning...")
-        transformer.requires_grad_(False) # Freeze EVERYTHING
+    # if args.editing=="source_cross_attn" and args.resume_from_iter is None:
+    #     logger.info("Freezing pre-trained weights for stable adapter-tuning...")
+    #     transformer.requires_grad_(False) # Freeze EVERYTHING
 
-        trainable_param_names = []
-        for name, param in transformer.named_parameters():
+    #     trainable_param_names = []
+    #     for name, param in transformer.named_parameters():
 
-            # Un-freeze ONLY the new layers you added
-            # (Using your new names 'attn_edit' and 'norm_edit')
-            if "attn_edit" in name or "norm_edit" in name or "source_proj_in" in name:
-                param.requires_grad = True
-                trainable_param_names.append(name)
+    #         # Un-freeze ONLY the new layers you added
+    #         # (Using your new names 'attn_edit' and 'norm_edit')
+    #         if "attn_edit" in name or "norm_edit" in name or "source_proj_in" in name:
+    #             param.requires_grad = True
+    #             trainable_param_names.append(name)
 
-        logger.info(f"Unfrozen {len(trainable_param_names)} new parameters for training.")
-        logger.info(f"Trainable params: {trainable_param_names}")
+        # logger.info(f"Unfrozen {len(trainable_param_names)} new parameters for training.")
+        # logger.info(f"Trainable params: {trainable_param_names}")
 
     logger.info("Initializing the optimizer and learning rate scheduler...\n")
     name_lr_mult = configs["train"].get("name_lr_mult", None)
@@ -896,402 +931,157 @@ def main():
         if args.text_conditioning != "none" and args.train_text_encoder:
             text_encoder.train()
 
-        # with accelerator.accumulate(transformer, condition_processor, text_encoder if args.text_conditioning != "none" and args.train_text_encoder else None):
-
-        #     images = batch["images"]
-        #     with torch.no_grad():
-        #         images = feature_extractor_dinov2(images=images, return_tensors="pt").pixel_values
-        #     images = images.to(device=accelerator.device, dtype=weight_dtype)
-        #     with torch.no_grad():
-        #         dino_output = image_encoder_dinov2(images)
-        #         image_embeds = dino_output.last_hidden_state
-        #         image_pooled = dino_output.pooler_output
-        #     negative_image_embeds = torch.zeros_like(image_embeds)
-
-        #     # --- CORRECTED PART 2: Use the initialized tokenizer instance ---
-        #     text_embeds = None
-        #     text_pooled = None
-        #     if args.text_conditioning != "none":
-        #         texts = batch["captions"]
-        #         with torch.no_grad():
-        #             text_inputs = tokenizer(
-        #                 texts,
-        #                 padding="max_length",
-        #                 max_length=tokenizer.model_max_length,
-        #                 truncation=True,
-        #                 return_tensors="pt",
-        #             )
-        #             text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
-        #             clip_output = text_encoder(**text_inputs)
-        #             text_embeds = clip_output.last_hidden_state
-        #             text_pooled = clip_output.pooler_output
-
-        #             uncond_input = tokenizer(
-        #                 [""] * len(texts),
-        #                 padding="max_length",
-        #                 max_length=tokenizer.model_max_length,
-        #                 truncation=True,
-        #                 return_tensors="pt",
-        #             )
-        #             uncond_input = {k: v.to(accelerator.device) for k, v in uncond_input.items()}
-        #             negative_text_embeds = text_encoder(**uncond_input).last_hidden_state
-
-        #     part_surfaces = batch["part_surfaces"]
-        #     part_surfaces = part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
-        #     print('==========================')
-        #     print(f"part_surfaces.shape before: {part_surfaces.shape}")
-
-        #     num_parts = batch["num_parts"]
-        #     num_objects = num_parts.shape[0]
-            
-        #     source_latents = None 
-        
-        #     if args.editing:
-        #         source_part_surfaces = batch["source_part_surfaces"]
-        #         source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
-        #         with torch.no_grad():
-        #             source_latents = vae.encode(
-        #                 source_part_surfaces,
-        #                 **configs["model"]["vae"]
-        #             ).latent_dist.sample()
-
-        #         print('==========================')
-        #         print(f"aource part_surfaces.shape before: {source_part_surfaces.shape}")
-            
-
-        #     with torch.no_grad():
-        #         latents = vae.encode(
-        #             part_surfaces,
-        #             **configs["model"]["vae"]
-        #         ).latent_dist.sample()
-
-        #     noise = torch.randn_like(latents)
-        #     u = compute_density_for_timestep_sampling(
-        #         weighting_scheme=configs["train"]["weighting_scheme"],
-        #         batch_size=num_objects,
-        #         logit_mean=configs["train"]["logit_mean"],
-        #         logit_std=configs["train"]["logit_std"],
-        #         mode_scale=configs["train"]["mode_scale"],
-        #     )
-        #     indices = (u * noise_scheduler.config.num_train_timesteps).long()
-        #     timesteps = noise_scheduler.timesteps[indices].to(accelerator.device)
-        #     timesteps = timesteps.repeat_interleave(num_parts)
-
-        #     sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
-        #     latent_model_input = noisy_latents = (1. - sigmas) * latents + sigmas * noise
-            
-        #     if configs["train"]["cfg_dropout_prob"] > 0:
-        #         dropout_mask = torch.rand(num_objects, device=accelerator.device) < configs["train"]["cfg_dropout_prob"]
-        #         dropout_mask = dropout_mask.repeat_interleave(num_parts)
-        #         if dropout_mask.any():
-        #             image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
-        #             if args.text_conditioning != "none": text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
-
-        #     # if not args.text_conditioning:
-        #     #     image_embeds = condition_processor(image=image_embeds, text=None) # this can be used for both text and image
-        #     # else:
-        #     #     image_embeds = condition_processor(image=None, text=text_embeds)
-        #     if args.text_conditioning == "adaln_text":
-        #         text_embeds = (text_embeds, text_pooled)
-        #     loss_contrastive, image_embeds = condition_processor(image=image_embeds, text=text_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts)
-        #     if args.text_conditioning == "adaln_text":
-        #         text_pooled = image_embeds[1]
-        #         image_embeds = image_embeds[0] 
-        #     # print(loss_contrastive)
-        #     print('==========================')
-        #     print(f"num_parts: {num_parts}, latent_model_input.shape: {latent_model_input.shape}, timesteps.shape: {timesteps.shape}, image_embeds.shape: {image_embeds.shape}, source_latents.shape: {source_latents.shape}")
-        #     model_pred = transformer(
-        #         hidden_states=latent_model_input,
-        #         timestep=timesteps,
-        #         encoder_hidden_states=image_embeds,
-        #         source_hidden_states=source_latents,
-        #         text_pooled=text_pooled if args.text_conditioning == "adaln_text" else None,
-        #         attention_kwargs={"num_parts": num_parts}
-        #     ).sample
-
-        #     if configs["train"]["training_objective"] == "x0":
-        #         model_pred = model_pred * (-sigmas) + noisy_latents
-        #         target = latents
-        #     elif configs["train"]["training_objective"] == 'v':
-        #         target = noise - latents
-        #     elif configs["train"]["training_objective"] == '-v':
-        #         # The training objective for TripoSG is the reverse of the flow matching objective. 
-        #         # It uses "different directions", i.e., the negative velocity. 
-        #         # This is probably a mistake in engineering, not very harmful. 
-        #         # In TripoSG's rectified flow scheduler, prev_sample = sample + (sigma - sigma_next) * model_output
-        #         # See TripoSG's scheduler https://github.com/VAST-AI-Research/TripoSG/blob/main/triposg/schedulers/scheduling_rectified_flow.py#L296
-        #         # While in diffusers's flow matching scheduler, prev_sample = sample + (sigma_next - sigma) * model_output
-        #         # See https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py#L454
-        #         target = latents - noise
-        #     else:
-        #         raise ValueError(f"Unknown training objective [{configs['train']['training_objective']}]")
-
-        #     weighting = compute_loss_weighting_for_sd3(
-        #         configs["train"]["weighting_scheme"],
-        #         sigmas
-        #     )
-
-        #     loss = weighting * tF.mse_loss(model_pred.float(), target.float(), reduction="none")
-        #     loss = loss.mean(dim=list(range(1, len(loss.shape))))
-        #     loss = loss.mean()
-
-        #     # accelerator.backward(loss.mean())
-        #     if "contrastive_text" in args.text_conditioning:
-        #         loss = loss*0.8 + loss_contrastive*0.2
-        #         # loss = loss + loss_contrastive
-        #     accelerator.backward(loss)
-        #     if accelerator.sync_gradients:
-        #         all_trainable_params = list(itertools.chain(condition_processor.parameters(), transformer.parameters()))
-        #         if args.text_conditioning != "none" and args.train_text_encoder:
-        #             all_trainable_params.extend(list(text_encoder.parameters()))
-        #         accelerator.clip_grad_norm_(all_trainable_params, args.max_grad_norm)
-
-        #     optimizer.step()
-        #     lr_scheduler.step()
-        #     optimizer.zero_grad()
         with accelerator.accumulate(transformer, condition_processor, text_encoder if args.text_conditioning != "none" and args.train_text_encoder else None):
 
-            if args.editing:
-                images = batch["images"] 
-                target_part_surfaces = batch["part_surfaces"].to(device=accelerator.device, dtype=weight_dtype)
-                source_part_surfaces = batch["source_part_surfaces"].to(device=accelerator.device, dtype=weight_dtype)
-                target_mask = batch["target_mask"].to(device=accelerator.device)
-                source_mask = batch["source_mask"].to(device=accelerator.device)
-                texts = batch["captions"] 
-                num_parts_tensor = batch["num_parts"].to(device=accelerator.device) # Shape [B]
+            assert args.editing != "none", "Only editing training loop is implemented here."
+            source_images = batch["source_images"]
+            target_images = batch["target_images"]
+            with torch.no_grad():
+                source_images = feature_extractor_dinov2(images=source_images, return_tensors="pt").pixel_values
+                target_images = feature_extractor_dinov2(images=target_images, return_tensors="pt").pixel_values
+            source_images = source_images.to(device=accelerator.device, dtype=weight_dtype)
+            target_images = target_images.to(device=accelerator.device, dtype=weight_dtype)
+            with torch.no_grad():
+                dino_output = image_encoder_dinov2(source_images)
+                source_image_embeds = dino_output.last_hidden_state
+                image_pooled = dino_output.pooler_output
+                target_image_embeds = image_encoder_dinov2(target_images).last_hidden_state
+            negative_image_embeds = torch.zeros_like(source_image_embeds)
 
-                num_objects = target_part_surfaces.shape[0]
-                max_parts = target_part_surfaces.shape[1]
-
-                # 2. Flatten from [B, M, P, K] -> [B*M, P, K]
-                target_part_surfaces_flat = target_part_surfaces.view(-1, *target_part_surfaces.shape[2:])
-                source_part_surfaces_flat = source_part_surfaces.view(-1, *source_part_surfaces.shape[2:])
-
-                # 3. Encode latents
+            # --- CORRECTED PART 2: Use the initialized tokenizer instance ---
+            text_embeds = None
+            text_pooled = None
+            if args.text_conditioning != "none":
+                texts = batch["captions"]
                 with torch.no_grad():
-                    # [B*M, P, K] -> [B*M, N, C]
-                    latents = vae.encode(
-                        target_part_surfaces_flat,
-                        **configs["model"]["vae"]
-                    ).latent_dist.sample()
+                    text_inputs = tokenizer(
+                        texts,
+                        padding="max_length",
+                        max_length=tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
+                    clip_output = text_encoder(**text_inputs)
+                    text_embeds = clip_output.last_hidden_state
+                    text_pooled = clip_output.pooler_output
 
+                    uncond_input = tokenizer(
+                        [""] * len(texts),
+                        padding="max_length",
+                        max_length=tokenizer.model_max_length,
+                        truncation=True,
+                        return_tensors="pt",
+                    )
+                    uncond_input = {k: v.to(accelerator.device) for k, v in uncond_input.items()}
+                    negative_text_embeds = text_encoder(**uncond_input).last_hidden_state
+
+            target_part_surfaces = batch["target_part_surfaces"]
+            # source_part_surfaces = batch["source_part_surfaces"]
+            assert target_part_surfaces.ndim == 3, "The target_part_surfaces should have shape [B, N, 3]"
+            # assert source_part_surfaces.ndim == 3, "The source_part_surfaces should have shape [B, N, 3]"
+            target_part_surfaces = target_part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
+            # source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
+
+            num_parts = batch["num_parts"]
+            # source_num_parts = batch["source_num_parts"]
+            num_objects = num_parts.shape[0]
+            # assert num_objects == source_num_parts.shape[0], "Mismatch between target number of objects and source number of parts."
+
+            with torch.no_grad():
+                latents = vae.encode(
+                    target_part_surfaces,
+                    **configs["model"]["vae"]
+                ).latent_dist.sample()
+
+            noise = torch.randn_like(latents)
+            u = compute_density_for_timestep_sampling(
+                weighting_scheme=configs["train"]["weighting_scheme"],
+                batch_size=num_objects,
+                logit_mean=configs["train"]["logit_mean"],
+                logit_std=configs["train"]["logit_std"],
+                mode_scale=configs["train"]["mode_scale"],
+            )
+            indices = (u * noise_scheduler.config.num_train_timesteps).long()
+            timesteps = noise_scheduler.timesteps[indices].to(accelerator.device)
+            timesteps = timesteps.repeat_interleave(num_parts)
+
+            sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
+            latent_model_input = noisy_latents = (1. - sigmas) * latents + sigmas * noise
+            
+            if configs["train"]["cfg_dropout_prob"] > 0:
+                dropout_mask = torch.rand(num_objects, device=accelerator.device) < configs["train"]["cfg_dropout_prob"]
+                dropout_mask = dropout_mask.repeat_interleave(num_parts)
+                if dropout_mask.any():
+                    source_image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
+                    if args.text_conditioning != "none": text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
+
+            # if not args.text_conditioning:
+            #     source_image_embeds = condition_processor(image=source_image_embeds, text=None) # this can be used for both text and image
+            # else:
+            #     source_image_embeds = condition_processor(image=None, text=text_embeds)
+            if args.text_conditioning == "adaln_text":
+                text_embeds = (text_embeds, text_pooled)
+            loss_cond_proc, source_image_embeds = condition_processor(image=source_image_embeds, text=text_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts, target_image_embed=target_image_embeds)
+            if args.text_conditioning == "adaln_text":
+                text_pooled = source_image_embeds[1]
+                source_image_embeds = source_image_embeds[0] 
+            if args.editing == "text_cross_attn":
+                text_embeds = source_image_embeds[0]
+                source_image_embeds = source_image_embeds[1]
+                
+            source_latents = None
+            if args.editing == "source_cross_attn":
+                source_part_surfaces = batch["source_part_surfaces"]
+                source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
+                with torch.no_grad():
                     source_latents = vae.encode(
-                        source_part_surfaces_flat,
+                        source_part_surfaces,
                         **configs["model"]["vae"]
                     ).latent_dist.sample()
+                
+            # print(loss_cond_proc)
+            model_pred = transformer(
+                hidden_states=latent_model_input,
+                timestep=timesteps,
+                encoder_hidden_states=source_image_embeds,
+                text_hidden_states=text_embeds if args.editing == "text_cross_attn" else None,
+                source_hidden_states=source_latents,
+                text_pooled=text_pooled if args.text_conditioning == "adaln_text" else None,
+                attention_kwargs={"num_parts": num_parts}
+            ).sample
 
-                # 4. Sample noise and timesteps
-                noise = torch.randn_like(latents) # Shape: [B*M, N, C]
-
-                u = compute_density_for_timestep_sampling(
-                    weighting_scheme=configs["train"]["weighting_scheme"],
-                    batch_size=num_objects, # <-- Sample per OBJECT
-                    logit_mean=configs["train"]["logit_mean"],
-                    logit_std=configs["train"]["logit_std"],
-                    mode_scale=configs["train"]["mode_scale"],
-                )
-                indices = (u * noise_scheduler.config.num_train_timesteps).long()
-                timesteps_per_object = noise_scheduler.timesteps[indices].to(accelerator.device) # Shape [B]
-
-                # Expand timestep for each part: [B] -> [B, M] -> [B*M]
-                timesteps = timesteps_per_object.unsqueeze(1).expand(-1, max_parts).reshape(-1) # Shape [B*M]
-
-                sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
-                latent_model_input = noisy_latents = (1. - sigmas) * latents + sigmas * noise # Shape [B*M, N, C]
-
-                # 5. Prepare Conditioning (Text)
-                text_embeds = None
-                text_pooled = None
-                negative_text_embeds = None
-                image_embeds = None # Not used for editing
-
-                if args.text_conditioning != "none":
-                    with torch.no_grad():
-                        text_inputs = tokenizer(
-                            texts,
-                            padding="max_length",
-                            max_length=tokenizer.model_max_length,
-                            truncation=True,
-                            return_tensors="pt",
-                        )
-                        text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
-                        clip_output = text_encoder(**text_inputs)
-                        text_embeds = clip_output.last_hidden_state # Shape [B, 77, 1024]
-                        text_pooled = clip_output.pooler_output   # Shape [B, D_pool]
-
-                        uncond_input = tokenizer(
-                            [""] * len(texts),
-                            padding="max_length",
-                            max_length=tokenizer.model_max_length,
-                            truncation=True,
-                            return_tensors="pt",
-                        )
-                        uncond_input = {k: v.to(accelerator.device) for k, v in uncond_input.items()}
-                        negative_text_embeds = text_encoder(**uncond_input).last_hidden_state
-
-                    # --- Expand text embeds from [B, ...] to [B*M, ...] ---
-                    text_embeds = text_embeds.unsqueeze(1).expand(-1, max_parts, -1, -1).reshape(-1, *text_embeds.shape[1:])
-                    negative_text_embeds = negative_text_embeds.unsqueeze(1).expand(-1, max_parts, -1, -1).reshape(-1, *negative_text_embeds.shape[1:])
-                    if text_pooled is not None:
-                        text_pooled = text_pooled.unsqueeze(1).expand(-1, max_parts, -1).reshape(-1, text_pooled.shape[-1])
-
-                # 6. CFG Dropout
-                if configs["train"]["cfg_dropout_prob"] > 0:
-                    dropout_mask_obj = torch.rand(num_objects, device=accelerator.device) < configs["train"]["cfg_dropout_prob"]
-                    dropout_mask = dropout_mask_obj.unsqueeze(1).expand(-1, max_parts).reshape(-1) # Shape [B*M]
-
-                    if dropout_mask.any():
-                        text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
-
-                # 7. Process Conditioning
-                if args.text_conditioning == "adaln_text":
-                    text_embeds = (text_embeds, text_pooled)
-
-                loss_contrastive, image_embeds = condition_processor(image=None, text=text_embeds, image_pooled=None, text_pooled=text_pooled, num_parts=num_parts_tensor)
-
-                if args.text_conditioning == "adaln_text":
-                    text_pooled = image_embeds[1]
-                    image_embeds = image_embeds[0] # This is the final text embed
-
-                print("==========================")
-                print(f"num_parts: {num_parts_tensor}, latent_model_input.shape: {latent_model_input.shape}, timesteps.shape: {timesteps.shape}, image_embeds.shape: {image_embeds.shape}, source_latents.shape: {source_latents.shape}")  
-                # 8. Call Transformer
-                model_pred = transformer(
-                    hidden_states=latent_model_input,  # [B*M, N, C]
-                    source_hidden_states=source_latents,      # [B*M, N, C]
-                    timestep=timesteps,                # [B*M]
-                    encoder_hidden_states=image_embeds,# [B*M, 77, 1024]
-                    text_pooled=text_pooled,           # [B*M, D_pool]
-                    attention_kwargs={"num_parts": num_parts_tensor, "part_mask": target_mask} # Pass masks
-                ).sample
-
-                # 9. Calculate Loss (Masking is CRITICAL)
-                if configs["train"]["training_objective"] == '-v':
-                    target = latents - noise
-                else:
-                    raise ValueError(f"Unknown training objective [{configs['train']['training_objective']}] for editing")
-
-                weighting = compute_loss_weighting_for_sd3(
-                    configs["train"]["weighting_scheme"],
-                    sigmas
-                )
-
-                loss = weighting * tF.mse_loss(model_pred.float(), target.float(), reduction="none")
-
-                target_mask_flat = target_mask.view(-1) 
-                loss = loss.mean(dim=list(range(1, len(loss.shape)))) 
-
-                loss = loss[target_mask_flat].mean() 
-
+            if configs["train"]["training_objective"] == "x0":
+                model_pred = model_pred * (-sigmas) + noisy_latents
+                target = latents
+            elif configs["train"]["training_objective"] == 'v':
+                target = noise - latents
+            elif configs["train"]["training_objective"] == '-v':
+                # The training objective for TripoSG is the reverse of the flow matching objective. 
+                # It uses "different directions", i.e., the negative velocity. 
+                # This is probably a mistake in engineering, not very harmful. 
+                # In TripoSG's rectified flow scheduler, prev_sample = sample + (sigma - sigma_next) * model_output
+                # See TripoSG's scheduler https://github.com/VAST-AI-Research/TripoSG/blob/main/triposg/schedulers/scheduling_rectified_flow.py#L296
+                # While in diffusers's flow matching scheduler, prev_sample = sample + (sigma_next - sigma) * model_output
+                # See https://github.com/huggingface/diffusers/blob/main/src/diffusers/schedulers/scheduling_flow_match_euler_discrete.py#L454
+                target = latents - noise
             else:
-                images = batch["images"]
-                with torch.no_grad():
-                    images = feature_extractor_dinov2(images=images, return_tensors="pt").pixel_values
-                images = images.to(device=accelerator.device, dtype=weight_dtype)
-                with torch.no_grad():
-                    dino_output = image_encoder_dinov2(images)
-                    image_embeds = dino_output.last_hidden_state
-                    image_pooled = dino_output.pooler_output
-                negative_image_embeds = torch.zeros_like(image_embeds)
+                raise ValueError(f"Unknown training objective [{configs['train']['training_objective']}]")
 
-                text_embeds = None
-                text_pooled = None
-                if args.text_conditioning != "none":
-                    texts = batch["captions"]
-                    with torch.no_grad():
-                        text_inputs = tokenizer(
-                            texts,
-                            padding="max_length",
-                            max_length=tokenizer.model_max_length,
-                            truncation=True,
-                            return_tensors="pt",
-                        )
-                        text_inputs = {k: v.to(accelerator.device) for k, v in text_inputs.items()}
-                        clip_output = text_encoder(**text_inputs)
-                        text_embeds = clip_output.last_hidden_state
-                        text_pooled = clip_output.pooler_output
+            weighting = compute_loss_weighting_for_sd3(
+                configs["train"]["weighting_scheme"],
+                sigmas
+            )
 
-                        uncond_input = tokenizer(
-                            [""] * len(texts),
-                            padding="max_length",
-                            max_length=tokenizer.model_max_length,
-                            truncation=True,
-                            return_tensors="pt",
-                        )
-                        uncond_input = {k: v.to(accelerator.device) for k, v in uncond_input.items()}
-                        negative_text_embeds = text_encoder(**uncond_input).last_hidden_state
+            loss = weighting * tF.mse_loss(model_pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape))))
+            loss = loss.mean()
 
-                part_surfaces = batch["part_surfaces"]
-                part_surfaces = part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
-
-                num_parts = batch["num_parts"]
-                num_objects = num_parts.shape[0]
-
-                with torch.no_grad():
-                    latents = vae.encode(
-                        part_surfaces,
-                        **configs["model"]["vae"]
-                    ).latent_dist.sample()
-
-                noise = torch.randn_like(latents)
-                u = compute_density_for_timestep_sampling(
-                    weighting_scheme=configs["train"]["weighting_scheme"],
-                    batch_size=num_objects,
-                    logit_mean=configs["train"]["logit_mean"],
-                    logit_std=configs["train"]["logit_std"],
-                    mode_scale=configs["train"]["mode_scale"],
-                )
-                indices = (u * noise_scheduler.config.num_train_timesteps).long()
-                timesteps = noise_scheduler.timesteps[indices].to(accelerator.device)
-                timesteps = timesteps.repeat_interleave(num_parts)
-
-                sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
-                latent_model_input = noisy_latents = (1. - sigmas) * latents + sigmas * noise
-
-                if configs["train"]["cfg_dropout_prob"] > 0:
-                    dropout_mask = torch.rand(num_objects, device=accelerator.device) < configs["train"]["cfg_dropout_prob"]
-                    dropout_mask = dropout_mask.repeat_interleave(num_parts)
-                    if dropout_mask.any():
-                        if image_embeds is not None: image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
-                        if args.text_conditioning != "none": text_embeds[dropout_mask] = negative_text_embeds[dropout_mask]
-
-                if args.text_conditioning == "adaln_text":
-                    text_embeds = (text_embeds, text_pooled)
-
-                loss_contrastive, image_embeds = condition_processor(image=image_embeds, text=text_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts)
-
-                if args.text_conditioning == "adaln_text":
-                    text_pooled = image_embeds[1]
-                    image_embeds = image_embeds[0] 
-
-                model_pred = transformer(
-                    hidden_states=latent_model_input,
-                    source_latent=None, # <-- No source latent for original mode
-                    timestep=timesteps,
-                    encoder_hidden_states=image_embeds,
-                    text_pooled=text_pooled if args.text_conditioning == "adaln_text" else None,
-                    attention_kwargs={"num_parts": num_parts}
-                ).sample
-
-                if configs["train"]["training_objective"] == '-v':
-                    target = latents - noise
-                else:
-                    raise ValueError(f"Unknown training objective [{configs['train']['training_objective']}]")
-
-                weighting = compute_loss_weighting_for_sd3(
-                    configs["train"]["weighting_scheme"],
-                    sigmas
-                )
-
-                loss = weighting * tF.mse_loss(model_pred.float(), target.float(), reduction="none")
-                loss = loss.mean(dim=list(range(1, len(loss.shape))))
-                loss = loss.mean()
-
-            # --- End of if/else block ---
-
-            if "contrastive_text" in args.text_conditioning and loss_contrastive is not None:
-                loss = loss*0.8 + loss_contrastive*0.2
-
+            # accelerator.backward(loss.mean())
+            if "contrastive_text" in args.text_conditioning:
+                loss = loss*0.8 + loss_cond_proc*0.2
+            if args.editing == "l1_tweak_latent":
+                loss = loss + loss_cond_proc
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 all_trainable_params = list(itertools.chain(condition_processor.parameters(), transformer.parameters()))
@@ -1448,38 +1238,53 @@ def log_validation(
             # randomly sample the next batch
             batch = next(random_val_dataloader)
         
-        images = batch["images"]
-        if len(images.shape) == 5:
-            images = images[0] # (1, N, H, W, 3) -> (N, H, W, 3)
-        images = [Image.fromarray(image) for image in images.cpu().numpy()]
-        N = len(images)
+        source_images = batch["source_images"]
+        target_images = batch["target_images"]
+        if len(source_images.shape) == 5:
+            source_images = source_images[0] # (1, N, H, W, 3) -> (N, H, W, 3)
+            target_images = target_images[0] # (1, N, H, W, 3) -> (N, H, W, 3)
+        source_images = [Image.fromarray(image) for image in source_images.cpu().numpy()]
+        target_images = [Image.fromarray(image) for image in target_images.cpu().numpy()]
+        N = len(source_images)
         captions = batch['captions']
         print(captions)
         assert (args.text_conditioning == "none") or (captions is not None), "Captions are required for text conditioning"
         if captions is not None:
             assert len(captions) == N, f"Number of captions {len(captions)} does not match number of images {N}"
-        part_surfaces = batch["part_surfaces"].cpu().numpy()
-        source_part_surfaces = None
-        if args.editing:
+        target_part_surfaces = batch["target_part_surfaces"].cpu().numpy()
+        # source_part_surfaces = None
+        # if args.editing != "none":
+            # source_part_surfaces = batch["source_part_surfaces"]
+            # with torch.no_grad():
+            #     source_latents = vae.encode(
+            #         source_part_surfaces,
+            #         **configs["model"]["vae"]
+            #     ).latent_dist.sample()
+        if len(target_part_surfaces.shape) == 4:
+            target_part_surfaces = target_part_surfaces[0] # (1, N, P, 6) -> (N, P, 6)
+
+        val_progress_bar.set_postfix(
+            {"num_parts": N}
+        )
+        source_latents = None
+        if args.editing == "source_cross_attn":
             source_part_surfaces = batch["source_part_surfaces"]
+            if len(source_part_surfaces.shape) == 4:
+                source_part_surfaces = source_part_surfaces[0] # (1, N, P, 6) -> (N, P, 6)
+            source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=vae.dtype)
             with torch.no_grad():
                 source_latents = vae.encode(
                     source_part_surfaces,
                     **configs["model"]["vae"]
                 ).latent_dist.sample()
-        if len(part_surfaces.shape) == 4:
-            part_surfaces = part_surfaces[0] # (1, N, P, 6) -> (N, P, 6)
-
-        val_progress_bar.set_postfix(
-            {"num_parts": N}
-        )
-
+        
         with torch.autocast("cuda", torch.float16):
             for guidance_scale in sorted(args.val_guidance_scales):
                 pred_part_meshes = pipeline(
-                    images,
+                    source_images,
                     captions,
-                    source_latents=source_latents,
+                    target_image=target_images,
+                    source_latents=source_latents if args.editing == "source_cross_attn" else None,
                     num_inference_steps=configs['val']['num_inference_steps'],
                     num_tokens=configs['model']['vae']['num_tokens'],
                     guidance_scale=guidance_scale, 
@@ -1495,7 +1300,8 @@ def log_validation(
                     os.makedirs(local_eval_dir, exist_ok=True)
                     rendered_images_list, rendered_normals_list = [], []
                     # 1. save the gt
-                    images[0].save(os.path.join(local_eval_dir, f"{val_step:04d}.png"))
+                    source_images[0].save(os.path.join(local_eval_dir, f"{val_step:04d}_source.png"))
+                    target_images[0].save(os.path.join(local_eval_dir, f"{val_step:04d}_target.png"))
                     if captions is not None:
                         with open(os.path.join(local_eval_dir, f"{val_step:04d}_caption.txt"), "w") as f:
                             f.write(batch["captions"][0][0])
@@ -1530,8 +1336,10 @@ def log_validation(
                     rendered_images_list.append(rendered_images)
                     rendered_normals_list.append(rendered_normals)
                     
-                    if images is not None:
-                        medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/gt_image"] += [images[0]] # List[Image.Image] TODO: support batch size > 1
+                    if source_images is not None:
+                        medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/source_image"] += [source_images[0]] # List[Image.Image] TODO: support batch size > 1
+                    if target_images is not None:
+                        medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/target_image"] += [target_images[0]] # List[Image.Image] TODO: support batch size > 1
                     medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/pred_rendered_images"] += rendered_images_list # List[List[Image.Image]]
                     medias_dictlist[f"guidance_scale_{guidance_scale:.1f}/pred_rendered_normals"] += rendered_normals_list # List[List[Image.Image]]
 
@@ -1540,7 +1348,7 @@ def log_validation(
                 parts_chamfer_distances, parts_f_scores = [], []
 
                 for n in range(N):
-                    gt_part_surface = part_surfaces[n]
+                    gt_part_surface = target_part_surfaces[n]
                     pred_part_mesh = pred_part_meshes[n]
                     if pred_part_mesh is None:
                         # If the generated mesh is None (decoing error), use a dummy mesh

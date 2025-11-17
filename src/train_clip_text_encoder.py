@@ -478,7 +478,7 @@ def main():
                 text=text_embeds,
                 image_pooled=image_pooled,
                 text_pooled=text_pooled,
-                num_parts=num_parts,
+                num_parts=num_parts
             )
             loss = loss_contrastive
 

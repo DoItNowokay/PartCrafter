@@ -187,8 +187,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         uncond_text_embeds = torch.zeros_like(text_embeds)
         uncond_text_pooled = torch.zeros_like(clip_output.pooler_output)
         
-        # if self.condition_processor.text_conditioning != "adaln_text":
-        #     text_pooled = None
+        if self.condition_processor.text_conditioning != "adaln_text":
+            text_pooled = None
 
         return text_embeds, uncond_text_embeds, text_pooled, uncond_text_pooled
 
@@ -219,6 +219,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         image: PipelineImageInput,
         captions: Optional[List[str]] = None,
         source_latents: Optional[torch.Tensor] = None,
+        target_image: PipelineImageInput = None,
         num_inference_steps: int = 50,
         num_tokens: int = 2048,
         timesteps: List[int] = None,
@@ -255,7 +256,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         # else:
         if isinstance(captions, str):
             captions = [captions]
-        batch_size = len(captions)
+            batch_size = len(captions)
 
         device = self._execution_device
         dtype = self.image_encoder_dinov2.dtype
@@ -264,6 +265,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         image_embeds, negative_image_embeds, image_pooled, negative_image_pooled = self.encode_image(
             image, device, num_images_per_prompt
         )
+        target_image_embeds = None
+        negative_target_image_embeds = None
+        if target_image is not None:
+            target_image_embeds, negative_target_image_embeds, _, _ = self.encode_image(
+                target_image, device, num_images_per_prompt
+            )
         text_embeds, negative_text_embeds, text_pooled, negative_text_pooled = self.encode_text(
             captions, device
         )
@@ -271,15 +278,24 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             text_embeds = (text_embeds, text_pooled)
             
         num_parts = torch.tensor([batch_size], device=device)
-        loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts)
-        loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, image_pooled=negative_image_pooled, text_pooled=negative_text_pooled, num_parts=num_parts)
+        loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts, target_image_embed=target_image_embeds)
+        loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, image_pooled=negative_image_pooled, text_pooled=negative_text_pooled, num_parts=num_parts, target_image_embed=negative_target_image_embeds)
         
         if self.condition_processor.text_conditioning == "adaln_text":
             text_pooled = image_embeds[1]
             image_embeds = image_embeds[0]
             
+        # text_embeds = None  # to save memory, as not used in adaln_text
+        if self.condition_processor.editing == "text_cross_attn":
+            text_embeds = image_embeds[0]
+            negative_text_embeds = negative_image_embeds[0]
+            image_embeds = image_embeds[1]
+            negative_image_embeds = negative_image_embeds[1]
+            
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
+            if text_embeds is not None and self.condition_processor.editing == "text_cross_attn":
+                text_embeds = torch.cat([negative_text_embeds, text_embeds], dim=0)
             
         # image_embeds = self.condition_processor(image=image_embeds, text=None) # this can be used for both text and image
 
@@ -303,6 +319,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             generator,
             latents,
         )
+        
+        if self.condition_processor.editing == "source_cross_attn" and source_latents is not None:
+            negative_source_latents = torch.zeros_like(source_latents)
+            if self.do_classifier_free_guidance:
+                source_latents = [negative_source_latents, source_latents]
 
         # 6. Denoising loop
         self.set_progress_bar_config(
@@ -324,12 +345,16 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
+                # print("Latent model input shape:", latent_model_input.shape)
+                # print("Image embeds shape:", image_embeds.shape)
+                # print("Text embeds shape:", text_embeds.shape if text_embeds is not None else "None")
                 noise_pred = self.transformer(
                     latent_model_input,
                     timestep,
                     encoder_hidden_states=image_embeds,
                     source_hidden_states=source_latents,
                     text_pooled=text_pooled if self.condition_processor.text_conditioning == "adaln_text" else None,
+                    text_hidden_states=text_embeds if self.condition_processor.editing == "text_cross_attn" else None,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0].to(dtype)
