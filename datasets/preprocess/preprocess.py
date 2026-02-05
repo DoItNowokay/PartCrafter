@@ -22,9 +22,9 @@ SHAPENET_MAP = {
     "pot": "pot", "printer": "printer", "skateboard": "skateboard", "sofa": "sofa",
     "stove": "stove", "table": "table", "telephone": "telephone", "train": "train_(railroad_vehicle)"
 }
-# SHAPENET_MAP = {
-#     "chair": "chair"
-# }
+SHAPENET_MAP = {
+    "chair": "chair"
+}
 
 def preprocess(args):
     input_path = args['input']
@@ -39,8 +39,13 @@ def preprocess(args):
         os.makedirs(output_path)
 
     source_meshes = {f for f in os.listdir(input_path) if f.endswith('.glb')}
-    processed_folders = {f for f in os.listdir(output_path) if os.path.isdir(os.path.join(output_path, f))}
-    processed_meshes_base = {folder for folder in processed_folders}
+    processed_meshes_base = set()
+    for f in os.listdir(output_path):
+        folder_path = os.path.join(output_path, f)
+        if os.path.isdir(folder_path):
+            if len(os.listdir(folder_path)) >= 4:
+                processed_meshes_base.add(f)
+    
     meshes_to_process = {mesh for mesh in source_meshes if mesh.replace('.glb', '') not in processed_meshes_base}
     if args['limit'] == -1:
         meshes_to_process = list(meshes_to_process)
@@ -55,13 +60,13 @@ def preprocess(args):
             mesh_path_quoted = f'"{mesh_path}"'
             output_path_quoted = f'"{output_path}"'
 
-            os.system(f"python3 datasets/preprocess/mesh_to_point.py --input {mesh_path_quoted} --output {output_path_quoted}")
-            os.system(f"python3 datasets/preprocess/render.py --input {mesh_path_quoted} --output {output_path_quoted}")
+            os.system(f"python datasets/preprocess/mesh_to_point.py --input {mesh_path_quoted} --output {output_path_quoted}")
+            os.system(f"python datasets/preprocess/render.py --input {mesh_path_quoted} --output {output_path_quoted}")
             export_mesh_folder = os.path.join(output_path, mesh_name.replace('.glb', ''))
             export_rendering_path = os.path.join(export_mesh_folder, 'rendering.png')
             export_rendering_path_quoted = f'"{export_rendering_path}"'
-            os.system(f"python3 datasets/preprocess/rmbg.py --input {export_rendering_path_quoted} --output {output_path_quoted}")
-            os.system(f"python3 datasets/preprocess/calculate_iou.py --input {mesh_path_quoted} --output {output_path_quoted}")
+            os.system(f"python datasets/preprocess/rmbg.py --input {export_rendering_path_quoted} --output {output_path_quoted}")
+            os.system(f"python datasets/preprocess/calculate_iou.py --input {mesh_path_quoted} --output {output_path_quoted}")
             time.sleep(1)
 
     configs = []
@@ -150,7 +155,7 @@ if __name__ == '__main__':
         if os.path.isdir(class_input_path):
             tasks.append({
                 'input': class_input_path,
-                'output': os.path.join(args.output, objaverse_name),
+                'output': os.path.join(args.output, args.dataset_name, objaverse_name),
                 'class_name': objaverse_name,
                 'dataset_name': args.dataset_name,
                 'limit': args.limit,
@@ -166,7 +171,6 @@ if __name__ == '__main__':
     print(f"Found {len(tasks)} valid classes to process.")
 
     results = []
-    # --- NEW LOGIC: Choose between parallel or sequential execution ---
     if args.sequential:
         print("Running in sequential mode.")
         for task in tqdm(tasks, desc="Overall Progress"):
@@ -190,3 +194,71 @@ if __name__ == '__main__':
         json.dump(all_configs, f, indent=4)
 
     print(f"\n🎉 All classes have been processed. Final aggregated config file saved to: {final_configs_path}")
+# import os
+# import json
+# import argparse
+# import time
+# from tqdm import tqdm
+
+# if __name__ == '__main__':
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument('--input', type=str, default='assets/objects')
+#     parser.add_argument('--output', type=str, default='preprocessed_data')
+#     args = parser.parse_args()
+
+#     input_path = args.input
+#     output_path = args.output
+
+#     assert os.path.exists(input_path), f'{input_path} does not exist'
+
+#     if not os.path.exists(output_path):
+#         os.makedirs(output_path)
+
+#     for mesh_name in tqdm(os.listdir(input_path)):
+#         mesh_path = os.path.join(input_path, mesh_name)
+#         # 1. Sample points from mesh surface
+#         os.system(f"python datasets/preprocess/mesh_to_point.py --input {mesh_path} --output {output_path}")
+#         # 2. Render images
+#         os.system(f"python datasets/preprocess/render.py --input {mesh_path} --output {output_path}")
+#         # 3. Remove background for rendered images and resize to 90%
+#         export_mesh_folder = os.path.join(output_path, mesh_name.replace('.glb', ''))
+#         export_rendering_path = os.path.join(export_mesh_folder, 'rendering.png')
+#         os.system(f"python datasets/preprocess/rmbg.py --input {export_rendering_path} --output {output_path}")
+#         # 4. (Optional) Calculate IoU
+#         os.system(f"python datasets/preprocess/calculate_iou.py --input {mesh_path} --output {output_path}")
+#         time.sleep(1)
+    
+#     # generate configs
+#     configs = []
+#     for mesh_name in tqdm(os.listdir(input_path)):
+#         mesh_path = os.path.join(output_path, mesh_name.replace('.glb', ''))
+#         num_parts_path = os.path.join(mesh_path, 'num_parts.json')
+#         surface_path = os.path.join(mesh_path, 'points.npy')
+#         image_path = os.path.join(mesh_path, 'rendering_rmbg.png')
+#         iou_path = os.path.join(mesh_path, 'iou.json')
+#         config = {
+#             "file": mesh_name,
+#             "num_parts": 0,
+#             "valid": False,
+#             "mesh_path": os.path.join(input_path, mesh_name),
+#             "surface_path": None,
+#             "image_path": None,
+#             "iou_mean": 0.0,
+#             "iou_max": 0.0
+#         }
+#         try:
+#             config["num_parts"] = json.load(open(num_parts_path))['num_parts']
+#             iou_config = json.load(open(iou_path))
+#             config['iou_mean'] = iou_config['iou_mean']
+#             config['iou_max'] = iou_config['iou_max']
+#             assert os.path.exists(surface_path)
+#             config['surface_path'] = surface_path
+#             assert os.path.exists(image_path)
+#             config['image_path'] = image_path
+#             config['valid'] = True
+#             configs.append(config)
+#         except:
+#             continue
+    
+#     configs_path = os.path.join(output_path, 'object_part_configs.json')
+#     json.dump(configs, open(configs_path, 'w'), indent=4)

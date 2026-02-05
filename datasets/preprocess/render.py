@@ -36,8 +36,8 @@ if __name__ == '__main__':
         mesh,
         radius=RADIUS,
         image_size=IMAGE_SIZE,
-        light_intensity=LIGHT_INTENSITY,
-        num_env_lights=NUM_ENV_LIGHTS,
+        # light_intensity=LIGHT_INTENSITY,
+        # num_env_lights=NUM_ENV_LIGHTS,
         return_type='pil'
     )
     image.save(os.path.join(output_path, f'rendering.png'))
