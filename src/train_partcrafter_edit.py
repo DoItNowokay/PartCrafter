@@ -235,7 +235,8 @@ def main():
         "--editing",
         type=str,
         default="none",
-        choices=["none", "source_cross_attn", "direct_tweak_latent", "l1_tweak_latent", "text_cross_attn"],
+        # choices=["none", "source_cross_attn", "direct_tweak_latent", "l1_tweak_latent", "text_cross_attn"],
+        choices=["none", "direct_tweak_latent", "l1_tweak_latent", "text_cross_attn"],
         help="Whether to perform editing"
     )
     parser.add_argument(
@@ -318,44 +319,44 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         
     train_loader = None
-    if args.editing == "source_cross_attn":
-        logger.info("Using Source Cross-Attention Editing Dataloader")
+    # if args.editing == "source_cross_attn":
+    #     logger.info("Using Source Cross-Attention Editing Dataloader")
 
-        train_dataset = BatchedShapeNetLatentEditing(
-            configs=configs,
-            batch_size=configs["train"]["batch_size_per_gpu"],
-            is_main_process=accelerator.is_main_process,
-            shuffle=True,
-            training=True,
-        )
-        val_dataset = ShapeNetLatentEditing(
-            configs=configs,
-            training=False,
-        )
-        train_loader = MultiEpochsDataLoader(
-            train_dataset,
-            batch_size=configs["train"]["batch_size_per_gpu"],
-            num_workers=args.num_workers,
-            drop_last=True,
-            pin_memory=args.pin_memory,
-            collate_fn=train_dataset.collate_fn,
-        )
-        val_loader = MultiEpochsDataLoader(
-            val_dataset,
-            batch_size=configs["val"]["batch_size_per_gpu"],
-            num_workers=args.num_workers,
-            drop_last=True,
-            pin_memory=args.pin_memory,
-        )
-        random_val_loader = MultiEpochsDataLoader(
-            val_dataset,
-            batch_size=configs["val"]["batch_size_per_gpu"],
-            shuffle=True,
-            num_workers=args.num_workers,
-            drop_last=True,
-            pin_memory=args.pin_memory,
-        )
-    elif args.editing != "none":
+    #     train_dataset = BatchedShapeNetLatentEditing(
+    #         configs=configs,
+    #         batch_size=configs["train"]["batch_size_per_gpu"],
+    #         is_main_process=accelerator.is_main_process,
+    #         shuffle=True,
+    #         training=True,
+    #     )
+    #     val_dataset = ShapeNetLatentEditing(
+    #         configs=configs,
+    #         training=False,
+    #     )
+    #     train_loader = MultiEpochsDataLoader(
+    #         train_dataset,
+    #         batch_size=configs["train"]["batch_size_per_gpu"],
+    #         num_workers=args.num_workers,
+    #         drop_last=True,
+    #         pin_memory=args.pin_memory,
+    #         collate_fn=train_dataset.collate_fn,
+    #     )
+    #     val_loader = MultiEpochsDataLoader(
+    #         val_dataset,
+    #         batch_size=configs["val"]["batch_size_per_gpu"],
+    #         num_workers=args.num_workers,
+    #         drop_last=True,
+    #         pin_memory=args.pin_memory,
+    #     )
+    #     random_val_loader = MultiEpochsDataLoader(
+    #         val_dataset,
+    #         batch_size=configs["val"]["batch_size_per_gpu"],
+    #         shuffle=True,
+    #         num_workers=args.num_workers,
+    #         drop_last=True,
+    #         pin_memory=args.pin_memory,
+    #     )
+    if args.editing != "none":
         if not args.text_conditioning:
             raise ValueError("Editing requires --text_conditioning to be enabled.")
 
@@ -1030,15 +1031,15 @@ def main():
                 text_embeds = source_image_embeds[0]
                 source_image_embeds = source_image_embeds[1]
                 
-            source_latents = None
-            if args.editing == "source_cross_attn":
-                source_part_surfaces = batch["source_part_surfaces"]
-                source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
-                with torch.no_grad():
-                    source_latents = vae.encode(
-                        source_part_surfaces,
-                        **configs["model"]["vae"]
-                    ).latent_dist.sample()
+            # source_latents = None
+            # if args.editing == "source_cross_attn":
+            #     source_part_surfaces = batch["source_part_surfaces"]
+            #     source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
+            #     with torch.no_grad():
+            #         source_latents = vae.encode(
+            #             source_part_surfaces,
+            #             **configs["model"]["vae"]
+            #         ).latent_dist.sample()
                 
             # print(loss_cond_proc)
             model_pred = transformer(
@@ -1046,7 +1047,7 @@ def main():
                 timestep=timesteps,
                 encoder_hidden_states=source_image_embeds,
                 text_hidden_states=text_embeds if args.editing == "text_cross_attn" else None,
-                source_hidden_states=source_latents,
+                # source_hidden_states=source_latents,
                 text_pooled=text_pooled if args.text_conditioning == "adaln_text" else None,
                 attention_kwargs={"num_parts": num_parts}
             ).sample
@@ -1266,17 +1267,17 @@ def log_validation(
         val_progress_bar.set_postfix(
             {"num_parts": N}
         )
-        source_latents = None
-        if args.editing == "source_cross_attn":
-            source_part_surfaces = batch["source_part_surfaces"]
-            if len(source_part_surfaces.shape) == 4:
-                source_part_surfaces = source_part_surfaces[0] # (1, N, P, 6) -> (N, P, 6)
-            source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=vae.dtype)
-            with torch.no_grad():
-                source_latents = vae.encode(
-                    source_part_surfaces,
-                    **configs["model"]["vae"]
-                ).latent_dist.sample()
+        # source_latents = None
+        # if args.editing == "source_cross_attn":
+        #     source_part_surfaces = batch["source_part_surfaces"]
+        #     if len(source_part_surfaces.shape) == 4:
+        #         source_part_surfaces = source_part_surfaces[0] # (1, N, P, 6) -> (N, P, 6)
+        #     source_part_surfaces = source_part_surfaces.to(device=accelerator.device, dtype=vae.dtype)
+        #     with torch.no_grad():
+        #         source_latents = vae.encode(
+        #             source_part_surfaces,
+        #             **configs["model"]["vae"]
+        #         ).latent_dist.sample()
         
         with torch.autocast("cuda", torch.float16):
             for guidance_scale in sorted(args.val_guidance_scales):
@@ -1284,7 +1285,7 @@ def log_validation(
                     source_images,
                     captions,
                     target_image=target_images,
-                    source_latents=source_latents if args.editing == "source_cross_attn" else None,
+                    # source_latents=source_latents if args.editing == "source_cross_attn" else None,
                     num_inference_steps=configs['val']['num_inference_steps'],
                     num_tokens=configs['model']['vae']['num_tokens'],
                     guidance_scale=guidance_scale, 

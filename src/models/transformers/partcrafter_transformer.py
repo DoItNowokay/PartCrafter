@@ -299,24 +299,24 @@ class DiTBlock(nn.Module):
                     bias=qkv_bias,
                     processor=TripoSGAttnProcessor2_0(),
                 )
-                torch.nn.init.zeros_(self.attn_text.to_out[0].weight)
-                torch.nn.init.zeros_(self.attn_text.to_out[0].bias)
+                # torch.nn.init.zeros_(self.attn_text.to_out[0].weight)
+                # torch.nn.init.zeros_(self.attn_text.to_out[0].bias)
 
-            if self.editing == "source_cross_attn":
-                self.norm_edit = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
-                self.attn_edit = Attention(
-                    query_dim=dim,
-                    cross_attention_dim=dim, # We will project the source latent to 'dim'
-                    dim_head=dim // num_attention_heads,
-                    heads=num_attention_heads,
-                    qk_norm="rms_norm" if qk_norm else None,
-                    cross_attention_norm=cross_attention_norm_type,
-                    eps=1e-6,
-                    bias=qkv_bias,
-                    processor=TripoSGAttnProcessor2_0(),
-                )
-                torch.nn.init.normal_(self.attn_edit.to_out[0].weight, mean=0.0, std=0.02)
-                torch.nn.init.zeros_(self.attn_edit.to_out[0].bias)
+            # if self.editing == "source_cross_attn":
+            #     self.norm_edit = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
+            #     self.attn_edit = Attention(
+            #         query_dim=dim,
+            #         cross_attention_dim=dim, # We will project the source latent to 'dim'
+            #         dim_head=dim // num_attention_heads,
+            #         heads=num_attention_heads,
+            #         qk_norm="rms_norm" if qk_norm else None,
+            #         cross_attention_norm=cross_attention_norm_type,
+            #         eps=1e-6,
+            #         bias=qkv_bias,
+            #         processor=TripoSGAttnProcessor2_0(),
+            #     )
+            #     torch.nn.init.normal_(self.attn_edit.to_out[0].weight, mean=0.0, std=0.02)
+            #     torch.nn.init.zeros_(self.attn_edit.to_out[0].bias)
         # 3. Feed-forward
         self.norm3 = FP32LayerNorm(dim, norm_eps, norm_elementwise_affine)
 
@@ -359,7 +359,7 @@ class DiTBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         text_encoder_hidden_states: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
-        source_hidden_states: Optional[torch.Tensor] = None,
+        # source_hidden_states: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         skip: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -416,13 +416,13 @@ class DiTBlock(nn.Module):
                     encoder_hidden_states=text_encoder_hidden_states,
                     **attention_kwargs,
                 )
-            if self.editing == "source_cross_attn":
-                hidden_states = hidden_states + self.attn_edit(
-                    self.norm_edit(hidden_states),
-                    encoder_hidden_states=source_hidden_states,
-                    image_rotary_emb=image_rotary_emb,
-                    **attention_kwargs,
-                )
+            # if self.editing == "source_cross_attn":
+            #     hidden_states = hidden_states + self.attn_edit(
+            #         self.norm_edit(hidden_states),
+            #         # encoder_hidden_states=source_hidden_states,
+            #         image_rotary_emb=image_rotary_emb,
+            #         **attention_kwargs,
+            #     )
         
         if torch.isnan(hidden_states).any():
             raise ValueError("NaN value detected in hidden_states after cross-attention in DiTBlock.")
@@ -531,10 +531,10 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.enable_part_embedding = enable_part_embedding
 
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
-        if self.editing == "source_cross_attn":
-            self.source_proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
-            torch.nn.init.zeros_(self.source_proj_in.weight)
-            torch.nn.init.zeros_(self.source_proj_in.bias)
+        # if self.editing == "source_cross_attn":
+        #     self.source_proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
+        #     torch.nn.init.zeros_(self.source_proj_in.weight)
+        #     torch.nn.init.zeros_(self.source_proj_in.bias)
     
         
         if text_conditioning == "adaln_text":
@@ -617,7 +617,8 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.global_attn_block_ids = global_attn_block_ids
 
 
-        if len(global_attn_block_ids) > 0 and not self.editing:
+        # if len(global_attn_block_ids) > 0 and not self.editing:
+        if len(global_attn_block_ids) > 0:
             # Override self-attention processors for global attention blocks
             attn_processor_dict = {}
             modified_attn_processor = []
@@ -626,10 +627,29 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     if layer_id in global_attn_block_ids:
                         # apply to both self-attention and cross-attention
                         attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = PartCrafterAttnProcessor()
+                        if self.editing == "text_cross_attn" and attn_id == 2:
+                            attn_processor_dict[f'blocks.{layer_id}.attn_text.processor'] = PartCrafterAttnProcessor()
+                            modified_attn_processor.append(f'blocks.{layer_id}.attn_text.processor')
                         modified_attn_processor.append(f'blocks.{layer_id}.attn{attn_id}.processor')
                     else:
                         attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = TripoSGAttnProcessor2_0()
+                        if self.editing == "text_cross_attn" and attn_id == 2:
+                            attn_processor_dict[f'blocks.{layer_id}.attn_text.processor'] = TripoSGAttnProcessor2_0()
             self.set_attn_processor(attn_processor_dict)
+        # if len(global_attn_block_ids) > 0:
+        #     # Override self-attention processors for global attention blocks
+        #     attn_processor_dict = {}
+        #     modified_attn_processor = []
+        #     for layer_id in range(num_layers):
+        #         for attn_id in [1, 2]:
+        #             if layer_id in global_attn_block_ids:
+        #                 # apply to both self-attention and cross-attention
+        #                 attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = PartCrafterAttnProcessor()
+        #                 attn_processor_dict[f'blocks.{layer_id}.attn_text.processor'] = PartCrafterAttnProcessor()
+        #                 modified_attn_processor.append(f'blocks.{layer_id}.attn{attn_id}.processor')
+        #             else:
+        #                 attn_processor_dict[f'blocks.{layer_id}.attn{attn_id}.processor'] = TripoSGAttnProcessor2_0()
+        #     self.set_attn_processor(attn_processor_dict)
             # logger.info(f"Modified {modified_attn_processor} to PartCrafterAttnProcessor")
         # if len(global_attn_block_ids) > 0 and self.editing == "source_cross_attn":
         #     attn_processor_dict = {}
@@ -825,7 +845,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         timestep: Union[int, float, torch.LongTensor],
         encoder_hidden_states: Optional[torch.Tensor] = None,
         text_hidden_states: Optional[torch.Tensor] = None,
-        source_hidden_states: Optional[torch.Tensor] = None,
+        # source_hidden_states: Optional[torch.Tensor] = None,
         text_pooled: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -896,17 +916,17 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         hidden_states = self.proj_in(hidden_states)
         
-        if self.editing == "source_cross_attn" and source_hidden_states is not None:
-            negative_source_hidden_states = None
-            if isinstance(source_hidden_states, list):
-                negative_source_hidden_states = source_hidden_states[0]
-                source_hidden_states = source_hidden_states[1]
-            source_hidden_states = self.source_proj_in(source_hidden_states)
-            if negative_source_hidden_states is not None:
-                negative_source_hidden_states = self.source_proj_in(negative_source_hidden_states)
-                source_hidden_states = torch.cat([source_hidden_states, negative_source_hidden_states], dim=0)
-            if torch.isnan(source_hidden_states).any():
-                raise ValueError("NaN value detected in projected source hidden states.")
+        # if self.editing == "source_cross_attn" and source_hidden_states is not None:
+        #     negative_source_hidden_states = None
+        #     if isinstance(source_hidden_states, list):
+        #         negative_source_hidden_states = source_hidden_states[0]
+        #         source_hidden_states = source_hidden_states[1]
+        #     source_hidden_states = self.source_proj_in(source_hidden_states)
+        #     if negative_source_hidden_states is not None:
+        #         negative_source_hidden_states = self.source_proj_in(negative_source_hidden_states)
+        #         source_hidden_states = torch.cat([source_hidden_states, negative_source_hidden_states], dim=0)
+        #     if torch.isnan(source_hidden_states).any():
+        #         raise ValueError("NaN value detected in projected source hidden states.")
 
 
         if self.text_conditioning != "adaln_text":
@@ -938,7 +958,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
         negative_text_hidden_states = torch.zeros_like(text_hidden_states) if text_hidden_states is not None else None
-        negative_source_hidden_states = torch.zeros_like(source_hidden_states) if source_hidden_states is not None else None
+        # negative_source_hidden_states = torch.zeros_like(source_hidden_states) if source_hidden_states is not None else None
 
         skips = []
         for layer, block in enumerate(self.blocks):
@@ -952,7 +972,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 # Do not inject control signal into non-global attention block
                 input_encoder_hidden_states = negative_encoder_hidden_states
                 input_text_hidden_states = negative_text_hidden_states
-                input_source_hidden_states = negative_source_hidden_states
+                # input_source_hidden_states = negative_source_hidden_states
             elif (
                 (not self.enable_global_cross_attn)
                 and len(self.global_attn_block_ids) > 0
@@ -962,11 +982,11 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 # Do not inject control signal into global attention block
                 input_encoder_hidden_states = negative_encoder_hidden_states
                 input_text_hidden_states = negative_text_hidden_states
-                input_source_hidden_states = negative_source_hidden_states
+                # input_source_hidden_states = negative_source_hidden_states
             else:
                 input_encoder_hidden_states = encoder_hidden_states
                 input_text_hidden_states = text_hidden_states
-                input_source_hidden_states = source_hidden_states
+                # input_source_hidden_states = source_hidden_states
             
             if len(self.global_attn_block_ids) > 0 and (layer in self.global_attn_block_ids):
                 # Inject control signal into global attention block
@@ -991,7 +1011,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     input_encoder_hidden_states,
                     input_text_hidden_states,
                     temb,
-                    input_source_hidden_states,
+                    # input_source_hidden_states,
                     image_rotary_emb,
                     skip,
                     input_attention_kwargs,
@@ -1002,7 +1022,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     hidden_states,
                     encoder_hidden_states=input_encoder_hidden_states,
                     text_encoder_hidden_states=input_text_hidden_states,
-                    source_hidden_states=input_source_hidden_states,
+                    # source_hidden_states=input_source_hidden_states,
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,

@@ -353,8 +353,8 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
             
         elif editing == "text_cross_attn":
             pass
-        elif editing == "source_cross_attn":
-            pass
+        # elif editing == "source_cross_attn":
+        #     pass
         else:
             raise ValueError(f"Unknown editing: {editing}")
 
@@ -549,8 +549,8 @@ class ConditionProcessor(ModelMixin, ConfigMixin):
         elif self.editing == "text_cross_attn":
             loss = None
             combined_feats = [text, image]
-        elif self.editing == "source_cross_attn":
-            pass
+        # elif self.editing == "source_cross_attn":
+        #     pass
         else:
             raise ValueError(f"Unknown editing: {self.editing}")
 

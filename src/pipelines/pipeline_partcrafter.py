@@ -1,5 +1,6 @@
 import inspect
 import math
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -17,6 +18,7 @@ from transformers import (
     Dinov2Model,
 )
 from ..utils.inference_utils import hierarchical_extract_geometry
+from ..utils.render_utils import render_views_around_mesh, export_renderings
 
 from ..models.autoencoders import TripoSGVAEModel
 from ..models.transformers import PartCrafterDiTModel
@@ -110,12 +112,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self,   
         vae: TripoSGVAEModel,
         transformer: PartCrafterDiTModel,
-        condition_processor: ConditionProcessor,
         scheduler: FlowMatchEulerDiscreteScheduler,
         image_encoder_dinov2: Dinov2Model,
         feature_extractor_dinov2: BitImageProcessor,
-        text_encoder: CLIPTextModel,
-        tokenizer: CLIPTokenizer,
+        condition_processor: Optional[ConditionProcessor] = None,
+        text_encoder: Optional[CLIPTextModel] = None,
+        tokenizer: Optional[CLIPTokenizer] = None,
     ):
         super().__init__()
 
@@ -218,7 +220,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         self,
         image: PipelineImageInput,
         captions: Optional[List[str]] = None,
-        source_latents: Optional[torch.Tensor] = None,
+        # source_latents: Optional[torch.Tensor] = None,
         target_image: PipelineImageInput = None,
         num_inference_steps: int = 50,
         num_tokens: int = 2048,
@@ -237,6 +239,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         flash_octree_depth: int = 9,
         use_flash_decoder: bool = True,
         return_dict: bool = True,
+        return_latent_diff: bool = False,
+        decode_intermediates: bool = False,
+        save_intermediate_dir: Optional[str] = None,
+        configs: Optional[Dict] = None,
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -271,31 +277,35 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             target_image_embeds, negative_target_image_embeds, _, _ = self.encode_image(
                 target_image, device, num_images_per_prompt
             )
-        text_embeds, negative_text_embeds, text_pooled, negative_text_pooled = self.encode_text(
-            captions, device
-        )
-        if self.condition_processor.text_conditioning == "adaln_text":
-            text_embeds = (text_embeds, text_pooled)
-            
-        num_parts = torch.tensor([batch_size], device=device)
-        loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts, target_image_embed=target_image_embeds)
-        loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, image_pooled=negative_image_pooled, text_pooled=negative_text_pooled, num_parts=num_parts, target_image_embed=negative_target_image_embeds)
         
-        if self.condition_processor.text_conditioning == "adaln_text":
-            text_pooled = image_embeds[1]
-            image_embeds = image_embeds[0]
+        # if self.condition_processor is not None:
+        #     text_embeds, negative_text_embeds, text_pooled, negative_text_pooled = self.encode_text(
+        #         captions, device
+        #     )
+        #     if self.condition_processor.text_conditioning == "adaln_text":
+        #         text_embeds = (text_embeds, text_pooled)
+                
+        #     num_parts = torch.tensor([batch_size], device=device)
+        #     loss_contrastive, image_embeds = self.condition_processor(text=text_embeds, image=image_embeds, image_pooled=image_pooled, text_pooled=text_pooled, num_parts=num_parts, target_image_embed=target_image_embeds)
+        #     loss_contrastive_negative, negative_image_embeds = self.condition_processor(text=negative_text_embeds, image=negative_image_embeds, image_pooled=negative_image_pooled, text_pooled=negative_text_pooled, num_parts=num_parts, target_image_embed=negative_target_image_embeds)
             
-        # text_embeds = None  # to save memory, as not used in adaln_text
-        if self.condition_processor.editing == "text_cross_attn":
-            text_embeds = image_embeds[0]
-            negative_text_embeds = negative_image_embeds[0]
-            image_embeds = image_embeds[1]
-            negative_image_embeds = negative_image_embeds[1]
+        #     if self.condition_processor.text_conditioning == "adaln_text":
+        #         text_pooled = image_embeds[1]
+        #         image_embeds = image_embeds[0]
+                
+        #     # text_embeds = None  # to save memory, as not used in adaln_text
+        #     if self.condition_processor.editing == "text_cross_attn":
+        #         text_embeds = image_embeds[0]
+        #         negative_text_embeds = negative_image_embeds[0]
+        #         image_embeds = image_embeds[1]
+        #         negative_image_embeds = negative_image_embeds[1]
+                
+        #     if self.do_classifier_free_guidance:
+        #         if text_embeds is not None and self.condition_processor.editing == "text_cross_attn":
+        #             text_embeds = torch.cat([negative_text_embeds, text_embeds], dim=0)
             
         if self.do_classifier_free_guidance:
             image_embeds = torch.cat([negative_image_embeds, image_embeds], dim=0)
-            if text_embeds is not None and self.condition_processor.editing == "text_cross_attn":
-                text_embeds = torch.cat([negative_text_embeds, text_embeds], dim=0)
             
         # image_embeds = self.condition_processor(image=image_embeds, text=None) # this can be used for both text and image
 
@@ -320,10 +330,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             latents,
         )
         
-        if self.condition_processor.editing == "source_cross_attn" and source_latents is not None:
-            negative_source_latents = torch.zeros_like(source_latents)
-            if self.do_classifier_free_guidance:
-                source_latents = [negative_source_latents, source_latents]
+        # if self.condition_processor.editing == "source_cross_attn" and source_latents is not None:
+        #     negative_source_latents = torch.zeros_like(source_latents)
+        #     if self.do_classifier_free_guidance:
+        #         source_latents = [negative_source_latents, source_latents]
 
         # 6. Denoising loop
         self.set_progress_bar_config(
@@ -331,6 +341,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             ncols=125,
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
+        diffs_per_part = [[ ] for _ in range(batch_size)] if return_latent_diff else None
+        prev_latents = None
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -352,9 +364,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     latent_model_input,
                     timestep,
                     encoder_hidden_states=image_embeds,
-                    source_hidden_states=source_latents,
-                    text_pooled=text_pooled if self.condition_processor.text_conditioning == "adaln_text" else None,
-                    text_hidden_states=text_embeds if self.condition_processor.editing == "text_cross_attn" else None,
+                    # source_hidden_states=source_latents,
+                    text_pooled=text_pooled if self.condition_processor and self.condition_processor.text_conditioning == "adaln_text" else None,
+                    text_hidden_states=text_embeds if self.condition_processor and self.condition_processor.editing == "text_cross_attn" else None,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0].to(dtype)
@@ -376,6 +388,47 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
+
+                if return_latent_diff and prev_latents is not None:
+                    for p in range(batch_size):
+                        diff = torch.mean(torch.abs(latents[p] - prev_latents[p])).item()
+                        diffs_per_part[p].append(diff)
+
+                if decode_intermediates and save_intermediate_dir and configs:
+                    # Decode and save current latents
+                    timestep_dir = os.path.join(save_intermediate_dir, f"timestep_{(len(timesteps)-i):03d}")
+                    os.makedirs(timestep_dir, exist_ok=True)
+                    render_cfg = configs['test']['rendering']
+                    for p in range(batch_size):
+                        geometric_func = lambda x: self.vae.decode(latents[p].unsqueeze(0), sampled_points=x).sample
+                        try:
+                            mesh_v_f = hierarchical_extract_geometry(
+                                geometric_func,
+                                device,
+                                dtype=latents.dtype,
+                                bounds=bounds,
+                                dense_octree_depth=dense_octree_depth,
+                                hierarchical_octree_depth=hierarchical_octree_depth,
+                                max_num_expanded_coords=max_num_expanded_coords,
+                            )
+                            mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float16), mesh_v_f[1])
+
+                            # Render
+                            rendered_images = render_views_around_mesh(
+                                mesh,
+                                num_views=render_cfg.get('num_views', 36),
+                                radius=render_cfg.get('radius', 4.0)
+                            )
+                            export_renderings(
+                                rendered_images,
+                                os.path.join(timestep_dir, f"part_{p:02d}.gif"),
+                                fps=render_cfg.get('fps', 18)
+                            )
+                            rendered_images[0].save(os.path.join(timestep_dir, f"part_{p:02d}.png"))
+                        except:
+                            pass  # Skip if decoding fails
+
+                prev_latents = latents.clone() if return_latent_diff else None
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -435,6 +488,23 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 output.append(mesh_v_f)
                 meshes.append(mesh)
                 progress_bar.update()
+                
+        # Plot diffs if intermediates were computed
+        # if return_latent_diff and save_intermediate_dir:
+        #     # try:
+        #     import matplotlib.pyplot as plt
+        #     plt.figure(figsize=(10, 6))
+        #     for p in range(batch_size):
+        #         plt.plot(diffs_per_part[p], label=f'Part {p:02d}')
+        #     plt.xlabel('Timestep')
+        #     plt.ylabel('Mean Absolute Difference in Tokens')
+        #     plt.title(f'Token Differences Over Timesteps')
+        #     plt.legend()
+        #     plt.grid(True)
+        #     plt.savefig(os.path.join(save_intermediate_dir, "token_diffs.png"))
+        #     plt.close()
+            # except ImportError:
+            #     pass  # Skip plotting if matplotlib not available
                 
         # print(meshes)
         # print(output)

@@ -90,9 +90,7 @@ def compute_cd_and_f_score(
 ):
     # min_1_to_2, min_2_to_1 = compute_mutual_nearest_distance_for_meshes(mesh1, mesh2, num_samples, metric=metric)
     # chamfer_dist = np.mean(min_2_to_1) + np.mean(min_1_to_2)
-    print(11)
     chamfer_dist = ChamferDistanceL2().cuda()(torch.tensor(mesh1, device='cuda').unsqueeze(0), torch.tensor(mesh2.vertices, device='cuda').unsqueeze(0)).item()
-    print(12)
     # precision_1 = np.mean((min_1_to_2 < threshold).astype(np.float32))
     # precision_2 = np.mean((min_2_to_1 < threshold).astype(np.float32))
     # fscore = 2 * precision_1 * precision_2 / (precision_1 + precision_2)

@@ -15,7 +15,8 @@ jaxtyping
 typeguard
 matplotlib
 imageio-ffmpeg
-pyrender
 deepspeed
 wandb[media]
 colormaps
+psutil
+GPUtil

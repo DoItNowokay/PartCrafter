@@ -15,6 +15,8 @@ dataset:
     # - 'datasets/object_part_configs.json' # Modify this path if you use your own dataset
     # - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/object_part_configs.json'
     # - 'preprocessed_data/objaverse/hf-objaverse-v1/glbs/object_part_configs.json'
+     - 'preprocessed_data/shapenet/lamp/object_part_configs.json'
+     - 'preprocessed_data/shapenet/display/object_part_configs.json'
      - 'preprocessed_data/shapenet/chair/object_part_configs.json'
     #  - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/table/object_part_configs.json'
     #  - 'preprocessed_data/objaverse/categorized_objaverse/hf-objaverse-v1/scissors/object_part_configs.json'
@@ -55,6 +57,7 @@ train:
   log_freq: 1
   early_eval_freq: 500
   early_eval: 1000
+  # eval_freq: 500
   eval_freq: 500
   save_freq: 500
   eval_freq_epoch: 5
@@ -64,7 +67,7 @@ train:
     use_ema_warmup: true
     inv_gamma: 1.
     power: 0.75
-  # trainable_modules: "   "
+  trainable_modules: "   "
   # trainable_modules: "text"
   # trainable_modules: "blocks.12.,blocks.13.,blocks.14.,blocks.15.,blocks.16.,blocks.17.,blocks.18.,blocks.19.,blocks.20."
   # trainable_modules: "time_embed,time_proj,part,proj_in,blocks.19.,blocks.20.,norm_out,proj_out,text_embed_proj"
