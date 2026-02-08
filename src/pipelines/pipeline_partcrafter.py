@@ -239,8 +239,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         flash_octree_depth: int = 9,
         use_flash_decoder: bool = True,
         return_dict: bool = True,
-        return_latent_diff: bool = False,
-        decode_intermediates: bool = False,
+        save_intermediates: bool = False,
+        save_tokens_diff: bool = False,
         save_intermediate_dir: Optional[str] = None,
         configs: Optional[Dict] = None,
     ):
@@ -341,7 +341,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             ncols=125,
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
-        diffs_per_part = [[ ] for _ in range(batch_size)] if return_latent_diff else None
+        diffs_per_part = [[ ] for _ in range(batch_size)] if save_tokens_diff else None
         prev_latents = None
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -389,12 +389,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
 
-                if return_latent_diff and prev_latents is not None:
+                if save_tokens_diff and prev_latents is not None:
                     for p in range(batch_size):
                         diff = torch.mean(torch.abs(latents[p] - prev_latents[p])).item()
                         diffs_per_part[p].append(diff)
 
-                if decode_intermediates and save_intermediate_dir and configs:
+                if save_intermediates and save_intermediate_dir:
                     # Decode and save current latents
                     timestep_dir = os.path.join(save_intermediate_dir, f"timestep_{(len(timesteps)-i):03d}")
                     os.makedirs(timestep_dir, exist_ok=True)
@@ -428,7 +428,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         except:
                             pass  # Skip if decoding fails
 
-                prev_latents = latents.clone() if return_latent_diff else None
+                prev_latents = latents.clone() if save_tokens_diff else None
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -490,21 +490,19 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 progress_bar.update()
                 
         # Plot diffs if intermediates were computed
-        # if return_latent_diff and save_intermediate_dir:
-        #     # try:
-        #     import matplotlib.pyplot as plt
-        #     plt.figure(figsize=(10, 6))
-        #     for p in range(batch_size):
-        #         plt.plot(diffs_per_part[p], label=f'Part {p:02d}')
-        #     plt.xlabel('Timestep')
-        #     plt.ylabel('Mean Absolute Difference in Tokens')
-        #     plt.title(f'Token Differences Over Timesteps')
-        #     plt.legend()
-        #     plt.grid(True)
-        #     plt.savefig(os.path.join(save_intermediate_dir, "token_diffs.png"))
-        #     plt.close()
-            # except ImportError:
-            #     pass  # Skip plotting if matplotlib not available
+        if save_tokens_diff and save_intermediate_dir:
+            os.makedirs(save_intermediate_dir, exist_ok=True)
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(10, 6))
+            for p in range(batch_size):
+                plt.plot(diffs_per_part[p], label=f'Part {p:02d}')
+            plt.xlabel('Timestep')
+            plt.ylabel('Mean Absolute Difference in Tokens')
+            plt.title(f'Token Differences Over Timesteps')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(save_intermediate_dir, "token_diffs.png"))
+            plt.close()
                 
         # print(meshes)
         # print(output)

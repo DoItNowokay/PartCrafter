@@ -165,6 +165,7 @@ def run_evaluation(
             "phase": "step_start",
             **get_gpu_stats(),
         })
+        save_iteration = accelerator.is_main_process and args.save_ratio > 0 and random.random() < args.save_ratio
         if step >= args.max_test_steps:
             break
 
@@ -223,9 +224,9 @@ def run_evaluation(
                 **get_gpu_stats(),
             })
             start_time = time.time()
-            return_intermediates = accelerator.is_main_process and args.save_ratio > 0 and random.random() < args.save_ratio
-            decode_intermediates = return_intermediates
-            save_intermediate_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}") if return_intermediates else None
+            save_intermediates = accelerator.is_main_process and args.save_intermediates and save_iteration
+            save_tokens_diff = accelerator.is_main_process and args.tokens_diff and save_iteration
+            save_intermediate_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
 
             output = pipeline(
                 [image_pil] * num_parts,
@@ -236,10 +237,10 @@ def run_evaluation(
                 guidance_scale=guidance_scale,
                 max_num_expanded_coords=configs['test']['max_num_expanded_coords'],
                 use_flash_decoder=configs['test']['use_flash_decoder'],
-                return_intermediates=return_intermediates,
-                decode_intermediates=decode_intermediates,
+                save_intermediates=save_intermediates,
+                save_tokens_diff=save_tokens_diff,
                 save_intermediate_dir=save_intermediate_dir,
-                configs=configs if return_intermediates else None,
+                configs=configs,
             )
             pred_part_meshes = output.meshes
             end_time = time.time()
@@ -304,7 +305,7 @@ def run_evaluation(
                 }
                 wandb.log(item_logs, step=step)
 
-            if accelerator.is_main_process and args.save_ratio > 0 and random.random() < args.save_ratio:
+            if accelerator.is_main_process and args.save_ratio > 0 and save_iteration:
                 local_eval_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
                 save_outputs(local_eval_dir, pred_part_meshes, input_image_pil, configs, args, guidance_scale, step, logger)
             
@@ -366,6 +367,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers. Set to 0 to avoid I/O bottlenecks.")
     parser.add_argument("--test_guidance_scales", type=float, nargs="+", default=[7.0], help="List of CFG scales to test.")
     parser.add_argument("--save_ratio", type=float, default=0.1, help="Ratio of outputs to save randomly (e.g., 0.1 saves 10%).")
+    parser.add_argument("--tokens_diff", action="store_true", help="Whether to save intermediate token differences for debugging.")
+    parser.add_argument("--save_intermediates", action="store_true", help="Whether to save intermediate meshes and renderings during generation.")
     parser.add_argument("--offline_wandb", action="store_true", help="Use offline WandB for experiment tracking")
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB for experiment tracking")
     args, extras = parser.parse_known_args()
