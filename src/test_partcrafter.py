@@ -49,7 +49,8 @@ from src.models.autoencoders import TripoSGVAEModel
 from src.models.transformers import PartCrafterDiTModel
 from src.pipelines.pipeline_partcrafter import PartCrafterPipeline
 from src.utils.train_utils import get_configs, save_experiment_params, save_model_architecture
-from src.utils.metric_utils import compute_cd_and_f_score_cuda
+# from src.utils.metric_utils import compute_cd_and_f_score_cuda
+from src.utils.metric_utils import *
 from src.models.briarmbg import BriaRMBG
 from src.utils.image_utils import prepare_image
 from src.utils.resource_utils import get_gpu_stats
@@ -198,7 +199,17 @@ def run_evaluation(
             )
             continue
 
-        gt_part_surfaces = batch["part_surfaces"][0]
+        gt_part_surfaces = batch["part_surfaces"]
+        # print(len(gt_part_surfaces))
+        # print(len(gt_part_surfaces[0]))
+        # print(len(gt_part_surfaces[0][0]))
+        # print(len(gt_part_surfaces[0][0][0]))
+        # print(len(gt_part_surfaces[0][0][0][0]))
+        # if len(gt_part_surfaces.shape) == 4:
+        gt_part_surfaces = gt_part_surfaces[0].cpu().numpy() # (1, N, P, 6) -> (N, P, 6)
+        # print(gt_part_surfaces.shape)
+        # print(gt_part_surfaces.shape)
+        # print(gt_part_surfaces.shape)
         num_parts = batch["num_parts"][0]
         
         # This limit is from inference_partcrafter.py (MAX_NUM_PARTS = 16)
@@ -258,10 +269,16 @@ def run_evaluation(
                 f"Generation Time: {generation_time:.2f} seconds"
             )
 
+            local_eval_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
+            for n in range(num_parts):
+                if pred_part_meshes[n] is None:
+                    # If the generated mesh is None (decoing error), use a dummy mesh
+                    pred_part_meshes[n] = trimesh.Trimesh(vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
+                # pred_part_meshes[n].export(os.path.join(local_eval_dir, f"{n:02d}.glb"))
             batch_cds, batch_f_scores = [], []
             for i in range(num_parts):
                 pred_mesh = pred_part_meshes[i]
-                gt_surface = gt_part_surfaces[i].to(accelerator.device, dtype=torch.float32) 
+                gt_surface = gt_part_surfaces[i]
 
                 if pred_mesh is None or len(pred_mesh.vertices) == 0:
                     if accelerator.is_main_process:
@@ -276,10 +293,19 @@ def run_evaluation(
                     pred_mesh = trimesh.Trimesh(vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
                     pred_part_meshes[i] = pred_mesh  # Replace None with dummy mesh for saving later
                 else:
-                    cd, f_score = compute_cd_and_f_score_cuda(
+                    # cd, f_score = compute_cd_and_f_score_cuda(
+                    #     gt_surface, pred_mesh,
+                    #     num_samples=configs['test']['metric']['cd_num_samples'],
+                    #     threshold=configs['test']['metric']['f1_score_threshold'],
+                    # )
+                    # cd, f_score = compute_cd_and_f_score(
+                    #     gt_surface.cpu().numpy(), pred_mesh
+                    # )
+                    cd, f_score = compute_cd_and_f_score_in_training(
                         gt_surface, pred_mesh,
                         num_samples=configs['test']['metric']['cd_num_samples'],
                         threshold=configs['test']['metric']['f1_score_threshold'],
+                        metric=configs['test']['metric']['cd_metric']
                     )
                     part_cd = cd.cpu() if isinstance(cd, torch.Tensor) else torch.tensor(cd)
                     part_f = f_score.cpu() if isinstance(f_score, torch.Tensor) else torch.tensor(f_score)
@@ -287,26 +313,33 @@ def run_evaluation(
                 if accelerator.is_main_process:
                     logger.info(
                         f"Step: {step:04d} | GS: {guidance_scale:<4.1f} | "
-                        f"Part: {i:02d} | CD: {part_cd.item():.4f} | F1: {part_f.item():.4f}"
+                        f"Part: {i:02d} | CD: {part_cd.item():.4f} | F1: {part_f.item():.4f} | "
+                        f"IoU: {IoU if IoU is not None else float('nan'):.4f}"
                     )
 
                 batch_cds.append(part_cd.item())
                 batch_f_scores.append(part_f.item())
             
+            # calculate IoU for the whole scene (merged mesh) if possible
+            IoU = None
+            if (num_parts > 1):
+                IoU = compute_IoU_for_scene(pred_part_meshes)
+            
             metrics_summary[guidance_scale]["chamfer"].extend(batch_cds)
             metrics_summary[guidance_scale]["f1_score"].extend(batch_f_scores)
+            metrics_summary[guidance_scale]["iou"].append(IoU)
 
             # Log per-item metrics/media to Weights & Biases (main process only)
             if accelerator.is_main_process and (not args.no_wandb):
                 item_logs = {
                     f"evaluation/cd_cfg{guidance_scale:.1f}": float(np.mean(batch_cds)),
                     f"evaluation/f1_cfg{guidance_scale:.1f}": float(np.mean(batch_f_scores)),
+                    f"evaluation/iou_cfg{guidance_scale:.1f}": IoU if IoU is not None else float('nan'),
                     "evaluation/num_parts": int(num_parts),
                 }
                 wandb.log(item_logs, step=step)
 
             if accelerator.is_main_process and args.save_ratio > 0 and save_iteration:
-                local_eval_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
                 save_outputs(local_eval_dir, pred_part_meshes, input_image_pil, configs, args, guidance_scale, step, logger)
             
     if accelerator.is_main_process:
@@ -320,7 +353,8 @@ def run_evaluation(
                 log_msg = (
                     f"Guidance Scale: {guidance_scale:<4.1f} | "
                     f"Avg Chamfer Distance: {avg_cd:.4f} | "
-                    f"Avg F1-Score: {avg_f1:.4f}"
+                    f"Avg F1-Score: {avg_f1:.4f} | "
+                    f"IoU: {np.mean(metrics['iou']) if len(metrics['iou']) else float('nan'):.4f}"
                 )
                 logger.info(log_msg)
                 f.write(log_msg + "\n")
@@ -335,6 +369,9 @@ def run_evaluation(
                     ),
                     f"evaluation/avg_f1_cfg{guidance_scale:.1f}": (
                         float(np.mean(metrics["f1_score"])) if len(metrics["f1_score"]) else float('nan')
+                    ),
+                    f"evaluation/avg_iou_cfg{guidance_scale:.1f}": (
+                        float(np.mean([x for x in metrics["iou"] if x is not None])) if any(x is not None for x in metrics["iou"]) else float('nan')
                     ),
                 })
             if aggregate_logs:
