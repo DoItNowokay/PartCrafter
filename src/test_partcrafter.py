@@ -9,6 +9,7 @@ diffusion_logging.set_verbosity_error()
 
 import sys
 import os
+import matplotlib.pyplot as plt
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Local imports
@@ -38,6 +39,7 @@ import json
 # Third-party
 import wandb
 import torch
+import torch.nn as nn
 import accelerate
 from accelerate import Accelerator
 from accelerate.logging import get_logger as get_accelerate_logger
@@ -58,7 +60,7 @@ from huggingface_hub import snapshot_download
 
 from src.datasets import ObjaversePartEvalDataset, collate_fn_eval
 from torch.utils.data import DataLoader
-
+from src.utils.gradient_analysis_utils import GradientSensitivityAnalyzer
 
 def save_outputs(
     local_eval_dir: str,
@@ -150,6 +152,12 @@ def run_evaluation(
 
     metrics_summary = defaultdict(lambda: defaultdict(list))
     resource_metrics = []  # List to collect structured resource data
+    
+    analyzer = None
+    if args.analyze_sensitivity:
+        # logger.info(f"Initializing Gradient Sensitivity Analyzer (Method: {args.gradient_analysis_method})")
+        analyzer = GradientSensitivityAnalyzer(method=args.gradient_analysis_method)
+        pipeline.transformer.requires_grad_(True)
 
     progress_bar = tqdm(
         enumerate(dataloader),
@@ -200,16 +208,7 @@ def run_evaluation(
             continue
 
         gt_part_surfaces = batch["part_surfaces"]
-        # print(len(gt_part_surfaces))
-        # print(len(gt_part_surfaces[0]))
-        # print(len(gt_part_surfaces[0][0]))
-        # print(len(gt_part_surfaces[0][0][0]))
-        # print(len(gt_part_surfaces[0][0][0][0]))
-        # if len(gt_part_surfaces.shape) == 4:
         gt_part_surfaces = gt_part_surfaces[0].cpu().numpy() # (1, N, P, 6) -> (N, P, 6)
-        # print(gt_part_surfaces.shape)
-        # print(gt_part_surfaces.shape)
-        # print(gt_part_surfaces.shape)
         num_parts = batch["num_parts"][0]
         
         # This limit is from inference_partcrafter.py (MAX_NUM_PARTS = 16)
@@ -238,21 +237,30 @@ def run_evaluation(
             save_intermediates = accelerator.is_main_process and args.save_intermediates and save_iteration
             save_tokens_diff = accelerator.is_main_process and args.tokens_diff and save_iteration
             save_intermediate_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
+            
+            if analyzer:
+                analyzer.reset_for_new_step(save_intermediate_dir)
 
-            output = pipeline(
-                [image_pil] * num_parts,
-                attention_kwargs={"num_parts": num_parts},
-                num_tokens=configs['model']['vae']['num_tokens'],
-                generator=generator,
-                num_inference_steps=configs['test']['num_inference_steps'],
-                guidance_scale=guidance_scale,
-                max_num_expanded_coords=configs['test']['max_num_expanded_coords'],
-                use_flash_decoder=configs['test']['use_flash_decoder'],
-                save_intermediates=save_intermediates,
-                save_tokens_diff=save_tokens_diff,
-                save_intermediate_dir=save_intermediate_dir,
-                configs=configs,
-            )
+            with torch.no_grad():
+                output = pipeline(
+                    [image_pil] * num_parts,
+                    attention_kwargs={"num_parts": num_parts},
+                    num_tokens=configs['model']['vae']['num_tokens'],
+                    generator=generator,
+                    num_inference_steps=configs['test']['num_inference_steps'],
+                    guidance_scale=guidance_scale,
+                    max_num_expanded_coords=configs['test']['max_num_expanded_coords'],
+                    use_flash_decoder=configs['test']['use_flash_decoder'],
+                    save_intermediates=save_intermediates,
+                    save_tokens_diff=save_tokens_diff,
+                    save_intermediate_dir=save_intermediate_dir, 
+                    configs=configs,
+                    analyzer=analyzer 
+                )
+            
+            if analyzer:
+                analyzer.plot_results()
+
             pred_part_meshes = output.meshes
             end_time = time.time()
             generation_time = end_time - start_time
@@ -313,8 +321,7 @@ def run_evaluation(
                 if accelerator.is_main_process:
                     logger.info(
                         f"Step: {step:04d} | GS: {guidance_scale:<4.1f} | "
-                        f"Part: {i:02d} | CD: {part_cd.item():.4f} | F1: {part_f.item():.4f} | "
-                        f"IoU: {IoU if IoU is not None else float('nan'):.4f}"
+                        f"Part: {i:02d} | CD: {part_cd.item():.4f} | F1: {part_f.item():.4f}"
                     )
 
                 batch_cds.append(part_cd.item())
@@ -324,6 +331,11 @@ def run_evaluation(
             IoU = None
             if (num_parts > 1):
                 IoU = compute_IoU_for_scene(pred_part_meshes)
+            if accelerator.is_main_process:
+                logger.info(
+                    f"Step: {step:04d} | GS: {guidance_scale:<4.1f} | "
+                    f"IoU for merged scene: {IoU:.4f}" if IoU is not None else "IoU for merged scene: N/A"
+                )
             
             metrics_summary[guidance_scale]["chamfer"].extend(batch_cds)
             metrics_summary[guidance_scale]["f1_score"].extend(batch_f_scores)
@@ -408,9 +420,27 @@ def main():
     parser.add_argument("--save_intermediates", action="store_true", help="Whether to save intermediate meshes and renderings during generation.")
     parser.add_argument("--offline_wandb", action="store_true", help="Use offline WandB for experiment tracking")
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB for experiment tracking")
+    parser.add_argument("--analyze_sensitivity", action="store_true", help="Enable gradient sensitivity analysis")
+    parser.add_argument("--gradient_analysis_method", type=str, default="gradient_norm", choices=["gradient_norm"], help="Method for gradient sensitivity analysis")
+    
     args, extras = parser.parse_known_args()
     configs = get_configs(args.config, extras)
 
+    precisions = ""
+    for prec in configs.test.bit_precision:
+        if prec == "fp16":
+            precisions += "fp16_"
+        elif prec == "bf16":
+            precisions += "bf16_"
+        elif prec == "fp32":
+            precisions += "fp32_"
+        else:
+            raise ValueError(f"Unsupported precision: {prec}")
+    max_num_samples = configs.dataset.get("max_num_samples", "all")
+    num_tokens = configs.model.vae.num_tokens
+    num_inference_steps = configs.test.num_inference_steps
+    args.tag = f"{args.tag}/num_tokens_{num_tokens}/max_samples_{max_num_samples}/diffusion_steps_{num_inference_steps}/{precisions}"
+    args.wandb_tag = args.tag.replace("/", "_")  # For cleaner WandB tags
     eval_dir = os.path.join(args.output_dir, f"{args.tag}/{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(eval_dir, exist_ok=True)
     
@@ -441,7 +471,14 @@ def main():
     rmbg_net.eval() 
 
     logger.info(f"Loading base models from: {partcrafter_weights_dir}")
-    weight_dtype = torch.float16
+    # set weight dtype based on config
+    assert len(configs.test.bit_precision) == 1, "Only single precision supported for testing as of now."
+    if configs.test.bit_precision[0] == "fp32":
+        weight_dtype = torch.float32
+    elif configs.test.bit_precision[0] == "fp16":
+        weight_dtype = torch.float16    
+    else:
+        raise ValueError(f"Unsupported precision: {configs.test.bit_precision[0]}")
 
     pipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir, torch_dtype=weight_dtype)
     pipeline.to(accelerator.device, weight_dtype)
@@ -457,8 +494,8 @@ def main():
     if accelerator.is_main_process and (not args.no_wandb):
         if args.offline_wandb:
             os.environ["WANDB_MODE"] = "offline"
-        wandb.init(project="PartCrafter", name=args.tag, config=exp_params, dir=eval_dir, resume=True)
-        arti_exp_info = wandb.Artifact(args.tag, type="eval_info")
+        wandb.init(project="PartCrafter", name=args.wandb_tag, config=exp_params, dir=eval_dir, resume=True)
+        arti_exp_info = wandb.Artifact(args.wandb_tag, type="eval_info")
         params_path = os.path.join(eval_dir, "params.yaml")
         model_path = os.path.join(eval_dir, "model.txt")
         log_path = os.path.join(eval_dir, "log.txt")

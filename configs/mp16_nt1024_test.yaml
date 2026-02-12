@@ -26,7 +26,7 @@ dataset:
   object_ratio: 0.3
   rotating_ratio: 0.2
   ratating_degree: 10
-  max_num_samples: 2000
+  max_num_samples: 20
 
 test:
   batch_size_per_gpu: 1
@@ -46,3 +46,4 @@ test:
     f1_score_threshold: 0.1
     default_cd: 1e6
     default_f1: 0.0
+  bit_precision: ["fp16"]
