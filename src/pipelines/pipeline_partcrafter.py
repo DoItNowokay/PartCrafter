@@ -243,6 +243,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         save_tokens_diff: bool = False,
         save_intermediate_dir: Optional[str] = None,
         configs: Optional[Dict] = None,
+        analyzer: Optional[Any] = None,
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -356,6 +357,19 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 )
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
+                
+                if analyzer is not None:
+                    # We pass the exact inputs the model is about to see
+                    analyzer.analyze_step(
+                        model=self.transformer,
+                        latents=latent_model_input,
+                        t=timestep,
+                        encoder_hidden_states=image_embeds,
+                        text_pooled=text_pooled if self.condition_processor and self.condition_processor.text_conditioning == "adaln_text" else None,
+                        text_hidden_states=text_embeds if self.condition_processor and self.condition_processor.editing == "text_cross_attn" else None,
+                        attention_kwargs=attention_kwargs,
+                        do_classifier_free_guidance=self.do_classifier_free_guidance
+                    )
 
                 # print("Latent model input shape:", latent_model_input.shape)
                 # print("Image embeds shape:", image_embeds.shape)
