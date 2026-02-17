@@ -244,6 +244,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         save_curvature: bool = False,
         save_entropy: bool = False,
         save_intermediate_dir: Optional[str] = None,
+        collect_dynamics_stats: bool = False,
         configs: Optional[Dict] = None,
         analyzer: Optional[Any] = None,
     ):
@@ -344,8 +345,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             ncols=125,
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
-        diffs_per_part = [[ ] for _ in range(batch_size)] if save_tokens_diff else None
-        curvature_per_part = [[ ] for _ in range(batch_size)] if save_curvature else None
+        track_token_diffs = save_tokens_diff or collect_dynamics_stats
+        track_curvature = save_curvature or collect_dynamics_stats
+        diffs_per_part = [[ ] for _ in range(batch_size)] if track_token_diffs else None
+        curvature_per_part = [[ ] for _ in range(batch_size)] if track_curvature else None
         entropy_per_part = [[ ] for _ in range(batch_size)] if save_entropy else None
         prev_latents = None
         prev_delta = None
@@ -412,12 +415,12 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
 
-                if save_tokens_diff and prev_latents is not None:
+                if track_token_diffs and prev_latents is not None:
                     for p in range(batch_size):
                         diff = torch.mean(torch.abs(latents[p] - prev_latents[p])).item()
                         diffs_per_part[p].append(diff)
 
-                if save_curvature and prev_latents is not None:
+                if track_curvature and prev_latents is not None:
                     current_delta = latents - prev_latents  # [batch, ...]
                     current_delta_flat = current_delta.flatten(start_dim=1)  # [batch, -1]
                     if prev_delta is not None:
@@ -471,7 +474,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         except:
                             pass  # Skip if decoding fails
 
-                prev_latents = latents.clone() if (save_tokens_diff or save_curvature) else None
+                prev_latents = latents.clone() if (track_token_diffs or track_curvature) else None
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -673,5 +676,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         if not return_dict:
             return (output, meshes)
 
-        return PartCrafterPipelineOutput(samples=output, meshes=meshes)
+        return PartCrafterPipelineOutput(
+            samples=output,
+            meshes=meshes,
+            token_diffs=diffs_per_part if track_token_diffs else None,
+            curvature=curvature_per_part if track_curvature else None,
+            entropy=entropy_per_part if save_entropy else None,
+        )
 

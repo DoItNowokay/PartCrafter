@@ -2,7 +2,8 @@ import psutil
 import GPUtil
 import torch
 import logging
-from typing import Dict, Any
+import time
+from typing import Dict, Any, List, Optional
 
 
 def get_cpu_stats() -> Dict[str, Any]:
@@ -58,3 +59,34 @@ def log_resource_usage(logger: logging.Logger, args, step: int, prefix: str = ""
     
     # Return combined stats for structured data
     return {"step": step, "prefix": prefix, **cpu_stats, **gpu_stats}
+
+
+def record_resource_snapshot(
+    step_idx: int,
+    guidance: Optional[float],
+    phase: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {
+        "timestamp": time.time(),
+        "step": step_idx,
+        "guidance_scale": guidance,
+        "phase": phase,
+    }
+    if extra:
+        snapshot.update(extra)
+    snapshot.update(get_gpu_stats())
+    return snapshot
+
+
+def compute_peak_vram_gb(snapshots: List[Dict[str, Any]]) -> float:
+    peak = 0.0
+    for snap in snapshots:
+        for key in ("gpu_memory_allocated_gb", "gpu_memory_reserved_gb"):
+            val = snap.get(key)
+            if isinstance(val, (int, float)):
+                peak = max(peak, float(val))
+        mem_mb = snap.get("gpu_memory_used_mb")
+        if isinstance(mem_mb, (int, float)):
+            peak = max(peak, float(mem_mb) / 1024.0)
+    return peak

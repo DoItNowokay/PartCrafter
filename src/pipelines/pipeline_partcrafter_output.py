@@ -15,3 +15,6 @@ class PartCrafterPipelineOutput(BaseOutput):
 
     samples: torch.Tensor
     meshes: List[trimesh.Trimesh]
+    token_diffs: Optional[List[List[float]]] = None
+    curvature: Optional[List[List[float]]] = None
+    entropy: Optional[List[List[float]]] = None

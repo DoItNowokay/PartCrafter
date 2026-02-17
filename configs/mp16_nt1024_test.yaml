@@ -26,7 +26,7 @@ dataset:
   object_ratio: 0.3
   rotating_ratio: 0.2
   ratating_degree: 10
-  max_num_samples: 20
+  max_num_samples: 1
 
 test:
   batch_size_per_gpu: 1
@@ -46,4 +46,19 @@ test:
     f1_score_threshold: 0.1
     default_cd: 1e6
     default_f1: 0.0
+  metrics_csv_fields:
+    - sample_id
+    - step_index
+    - guidance_scale
+    - part_index
+    - num_parts
+    - chamfer_distance
+    - fscore
+    - scene_iou
+    - bops_billions
+    - abw_weights_bits
+    - abw_activations_bits
+    - latency_seconds
+    - peak_vram_gb
+    - token_throughput
   bit_precision: ["fp16"]
