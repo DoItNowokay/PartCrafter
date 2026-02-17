@@ -241,6 +241,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         return_dict: bool = True,
         save_intermediates: bool = False,
         save_tokens_diff: bool = False,
+        save_curvature: bool = False,
+        save_entropy: bool = False,
         save_intermediate_dir: Optional[str] = None,
         configs: Optional[Dict] = None,
         analyzer: Optional[Any] = None,
@@ -343,7 +345,10 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
         diffs_per_part = [[ ] for _ in range(batch_size)] if save_tokens_diff else None
+        curvature_per_part = [[ ] for _ in range(batch_size)] if save_curvature else None
+        entropy_per_part = [[ ] for _ in range(batch_size)] if save_entropy else None
         prev_latents = None
+        prev_delta = None
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -371,9 +376,13 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         do_classifier_free_guidance=self.do_classifier_free_guidance
                     )
 
-                # print("Latent model input shape:", latent_model_input.shape)
-                # print("Image embeds shape:", image_embeds.shape)
-                # print("Text embeds shape:", text_embeds.shape if text_embeds is not None else "None")
+                entropy_list = [] if save_entropy else None
+                # print('save entropy in pipeline:', save_entropy)
+                if save_entropy:
+                    attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
+                    attention_kwargs['compute_entropy'] = True
+                    attention_kwargs['entropy_list'] = entropy_list
+
                 noise_pred = self.transformer(
                     latent_model_input,
                     timestep,
@@ -407,6 +416,26 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     for p in range(batch_size):
                         diff = torch.mean(torch.abs(latents[p] - prev_latents[p])).item()
                         diffs_per_part[p].append(diff)
+
+                if save_curvature and prev_latents is not None:
+                    current_delta = latents - prev_latents  # [batch, ...]
+                    current_delta_flat = current_delta.flatten(start_dim=1)  # [batch, -1]
+                    if prev_delta is not None:
+                        prev_delta_flat = prev_delta.flatten(start_dim=1)
+                        dot_product = torch.sum(current_delta_flat * prev_delta_flat, dim=-1)
+                        norm_current = torch.norm(current_delta_flat, dim=-1)
+                        norm_prev = torch.norm(prev_delta_flat, dim=-1)
+                        cos_sim = dot_product / (norm_current * norm_prev + 1e-8)
+                        curvature = 1 - cos_sim
+                        for p in range(batch_size):
+                            curvature_per_part[p].append(curvature[p].item())
+                    prev_delta = current_delta.clone()
+
+                # print(entropy_list)
+                if save_entropy and entropy_list:
+                    avg_entropy = torch.stack(entropy_list).mean(dim=0)
+                    for p in range(batch_size):
+                        entropy_per_part[p].append(avg_entropy[p].item())
 
                 if save_intermediates and save_intermediate_dir:
                     # Decode and save current latents
@@ -442,7 +471,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                         except:
                             pass  # Skip if decoding fails
 
-                prev_latents = latents.clone() if save_tokens_diff else None
+                prev_latents = latents.clone() if (save_tokens_diff or save_curvature) else None
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -503,20 +532,138 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 meshes.append(mesh)
                 progress_bar.update()
                 
-        # Plot diffs if intermediates were computed
-        if save_tokens_diff and save_intermediate_dir:
+        # Plot diffs and/or curvature if intermediates were computed
+        if (save_tokens_diff or save_curvature or save_entropy) and save_intermediate_dir:
             os.makedirs(save_intermediate_dir, exist_ok=True)
             import matplotlib.pyplot as plt
-            plt.figure(figsize=(10, 6))
-            for p in range(batch_size):
-                plt.plot(diffs_per_part[p], label=f'Part {p:02d}')
-            plt.xlabel('Timestep')
-            plt.ylabel('Mean Absolute Difference in Tokens')
-            plt.title(f'Token Differences Over Timesteps')
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(os.path.join(save_intermediate_dir, "token_diffs.png"))
-            plt.close()
+            
+            if save_tokens_diff and save_curvature and save_entropy:
+                # Plot all three
+                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 15))
+                for p in range(batch_size):
+                    ax1.plot(diffs_per_part[p], label=f'Part {p:02d}')
+                ax1.set_xlabel('Timestep')
+                ax1.set_ylabel('Mean Absolute Difference in Tokens')
+                ax1.set_title('Token Differences Over Timesteps')
+                ax1.legend()
+                ax1.grid(True)
+                
+                for p in range(batch_size):
+                    ax2.plot(curvature_per_part[p], label=f'Part {p:02d}')
+                ax2.set_xlabel('Timestep')
+                ax2.set_ylabel('Curvature (1 - cos(θ))')
+                ax2.set_title('Curvature Over Timesteps')
+                ax2.legend()
+                ax2.grid(True)
+                
+                for p in range(batch_size):
+                    ax3.plot(entropy_per_part[p], label=f'Part {p:02d}')
+                ax3.set_xlabel('Timestep')
+                ax3.set_ylabel('Average Shanon Entropy')
+                ax3.set_title('Shanon Entropy Over Timesteps')
+                ax3.legend()
+                ax3.grid(True)
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_intermediate_dir, "token_diff_curvature_shanon_entropy.png"))
+                plt.close()
+            elif save_tokens_diff and save_curvature:
+                # Plot both in subplots
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+                for p in range(batch_size):
+                    ax1.plot(diffs_per_part[p], label=f'Part {p:02d}')
+                ax1.set_xlabel('Timestep')
+                ax1.set_ylabel('Mean Absolute Difference in Tokens')
+                ax1.set_title('Token Differences Over Timesteps')
+                ax1.legend()
+                ax1.grid(True)
+                
+                for p in range(batch_size):
+                    ax2.plot(curvature_per_part[p], label=f'Part {p:02d}')
+                ax2.set_xlabel('Timestep')
+                ax2.set_ylabel('Curvature (1 - cos(θ))')
+                ax2.set_title('Curvature Over Timesteps')
+                ax2.legend()
+                ax2.grid(True)
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_intermediate_dir, "token_diff_and_curvature.png"))
+                plt.close()
+            elif save_tokens_diff and save_entropy:
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+                for p in range(batch_size):
+                    ax1.plot(diffs_per_part[p], label=f'Part {p:02d}')
+                ax1.set_xlabel('Timestep')
+                ax1.set_ylabel('Mean Absolute Difference in Tokens')
+                ax1.set_title('Token Differences Over Timesteps')
+                ax1.legend()
+                ax1.grid(True)
+                
+                for p in range(batch_size):
+                    ax2.plot(entropy_per_part[p], label=f'Part {p:02d}')
+                ax2.set_xlabel('Timestep')
+                ax2.set_ylabel('Average Shanon Entropy')
+                ax2.set_title('Shanon Entropy Over Timesteps')
+                ax2.legend()
+                ax2.grid(True)
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_intermediate_dir, "token_diff_and_shanon_entropy.png"))
+                plt.close()
+            elif save_curvature and save_entropy:
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+                for p in range(batch_size):
+                    ax1.plot(curvature_per_part[p], label=f'Part {p:02d}')
+                ax1.set_xlabel('Timestep')
+                ax1.set_ylabel('Curvature (1 - cos(θ))')
+                ax1.set_title('Curvature Over Timesteps')
+                ax1.legend()
+                ax1.grid(True)
+                
+                for p in range(batch_size):
+                    ax2.plot(entropy_per_part[p], label=f'Part {p:02d}')
+                ax2.set_xlabel('Timestep')
+                ax2.set_ylabel('Average Shanon Entropy')
+                ax2.set_title('Shanon Entropy Over Timesteps')
+                ax2.legend()
+                ax2.grid(True)
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_intermediate_dir, "curvature_and_shanon_entropy.png"))
+                plt.close()
+            elif save_tokens_diff:
+                plt.figure(figsize=(10, 6))
+                for p in range(batch_size):
+                    plt.plot(diffs_per_part[p], label=f'Part {p:02d}')
+                plt.xlabel('Timestep')
+                plt.ylabel('Mean Absolute Difference in Tokens')
+                plt.title('Token Differences Over Timesteps')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(save_intermediate_dir, "token_diffs.png"))
+                plt.close()
+            elif save_curvature:
+                plt.figure(figsize=(10, 6))
+                for p in range(batch_size):
+                    plt.plot(curvature_per_part[p], label=f'Part {p:02d}')
+                plt.xlabel('Timestep')
+                plt.ylabel('Curvature (1 - cos(θ))')
+                plt.title('Curvature Over Timesteps')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(save_intermediate_dir, "curvature.png"))
+                plt.close()
+            elif save_entropy:
+                plt.figure(figsize=(10, 6))
+                for p in range(batch_size):
+                    plt.plot(entropy_per_part[p], label=f'Part {p:02d}')
+                plt.xlabel('Timestep')
+                plt.ylabel('Average Shanon Entropy')
+                plt.title('Shanon Entropy Over Timesteps')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(save_intermediate_dir, "shanon_entropy.png"))
+                plt.close()
                 
         # print(meshes)
         # print(output)

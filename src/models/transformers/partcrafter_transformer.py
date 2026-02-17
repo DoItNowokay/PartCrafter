@@ -366,6 +366,9 @@ class DiTBlock(nn.Module):
     ) -> torch.Tensor:
         # Prepare attention kwargs
         attention_kwargs = attention_kwargs or {}
+        compute_entropy = attention_kwargs.get("compute_entropy", False)
+        entropy_list = attention_kwargs.get("entropy_list")
+        attn_num_parts = attention_kwargs.get("num_parts")
 
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Long Skip Connection
@@ -394,7 +397,9 @@ class DiTBlock(nn.Module):
             attn_output = self.attn1(
                 norm_hidden_states,
                 image_rotary_emb=image_rotary_emb,
-                **attention_kwargs,
+                num_parts=attn_num_parts,
+                compute_entropy=compute_entropy,
+                entropy_list=entropy_list,
             )
             hidden_states = hidden_states + attn_output
 
@@ -408,13 +413,17 @@ class DiTBlock(nn.Module):
                 self.norm2(hidden_states),
                 encoder_hidden_states=encoder_hidden_states,
                 image_rotary_emb=image_rotary_emb,
-                **attention_kwargs,
+                num_parts=attn_num_parts,
+                compute_entropy=compute_entropy,
+                entropy_list=entropy_list,
             )
             if self.editing == "text_cross_attn":
                 hidden_states = hidden_states + self.attn_text(
                     self.norm_text(hidden_states),
                     encoder_hidden_states=text_encoder_hidden_states,
-                    **attention_kwargs,
+                    num_parts=attn_num_parts,
+                    compute_entropy=compute_entropy,
+                    entropy_list=entropy_list,
                 )
             # if self.editing == "source_cross_attn":
             #     hidden_states = hidden_states + self.attn_edit(
@@ -988,11 +997,18 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 input_text_hidden_states = text_hidden_states
                 # input_source_hidden_states = source_hidden_states
             
-            if len(self.global_attn_block_ids) > 0 and (layer in self.global_attn_block_ids):
+            input_attention_kwargs = None
+            if len(self.global_attn_block_ids) == 0:
+                input_attention_kwargs = attention_kwargs
+            elif layer in self.global_attn_block_ids:
                 # Inject control signal into global attention block
                 input_attention_kwargs = attention_kwargs
             else:
-                input_attention_kwargs = None
+                if attention_kwargs is not None:
+                    allowed_keys = ["compute_entropy", "entropy_list", "num_parts"]
+                    input_attention_kwargs = {k: v for k, v in attention_kwargs.items() if k in allowed_keys}
+                else:
+                    input_attention_kwargs = None
 
             if self.training and self.gradient_checkpointing:
 
@@ -1018,6 +1034,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     **ckpt_kwargs,
                 )
             else:
+                # print('input attention kwargs in transformer block:', input_attention_kwargs)
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=input_encoder_hidden_states,

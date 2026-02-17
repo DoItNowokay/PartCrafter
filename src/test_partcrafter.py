@@ -35,6 +35,7 @@ from tqdm import tqdm
 import time
 import random
 import json
+import re
 
 # Third-party
 import wandb
@@ -61,6 +62,11 @@ from huggingface_hub import snapshot_download
 from src.datasets import ObjaversePartEvalDataset, collate_fn_eval
 from torch.utils.data import DataLoader
 from src.utils.gradient_analysis_utils import GradientSensitivityAnalyzer
+
+def sanitize_artifact_name(name: str) -> str:
+    sanitized = re.sub(r"[^0-9A-Za-z._-]+", "_", name)
+    sanitized = sanitized.strip("_")
+    return sanitized or "artifact"
 
 def save_outputs(
     local_eval_dir: str,
@@ -156,7 +162,7 @@ def run_evaluation(
     analyzer = None
     if args.analyze_sensitivity:
         # logger.info(f"Initializing Gradient Sensitivity Analyzer (Method: {args.gradient_analysis_method})")
-        analyzer = GradientSensitivityAnalyzer(method=args.gradient_analysis_method)
+        analyzer = GradientSensitivityAnalyzer(methods=args.gradient_analysis_method)
         pipeline.transformer.requires_grad_(True)
 
     progress_bar = tqdm(
@@ -236,6 +242,8 @@ def run_evaluation(
             start_time = time.time()
             save_intermediates = accelerator.is_main_process and args.save_intermediates and save_iteration
             save_tokens_diff = accelerator.is_main_process and args.tokens_diff and save_iteration
+            save_curvature = accelerator.is_main_process and args.curvature and save_iteration
+            save_entropy = accelerator.is_main_process and args.entropy and save_iteration
             save_intermediate_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
             
             if analyzer:
@@ -253,6 +261,8 @@ def run_evaluation(
                     use_flash_decoder=configs['test']['use_flash_decoder'],
                     save_intermediates=save_intermediates,
                     save_tokens_diff=save_tokens_diff,
+                    save_curvature=save_curvature,
+                    save_entropy=save_entropy,
                     save_intermediate_dir=save_intermediate_dir, 
                     configs=configs,
                     analyzer=analyzer 
@@ -366,7 +376,7 @@ def run_evaluation(
                     f"Guidance Scale: {guidance_scale:<4.1f} | "
                     f"Avg Chamfer Distance: {avg_cd:.4f} | "
                     f"Avg F1-Score: {avg_f1:.4f} | "
-                    f"IoU: {np.mean(metrics['iou']) if len(metrics['iou']) else float('nan'):.4f}"
+                    f"IoU: {np.mean([x for x in metrics['iou'] if x is not None]) if any(x is not None for x in metrics['iou']) else float('nan'):.4f}"
                 )
                 logger.info(log_msg)
                 f.write(log_msg + "\n")
@@ -389,7 +399,8 @@ def run_evaluation(
             if aggregate_logs:
                 wandb.log(aggregate_logs)
             # Attach result file as an artifact
-            arti = wandb.Artifact(args.tag + "_eval", type="evaluation")
+            artifact_name = f"{sanitize_artifact_name(args.tag)}_eval"
+            arti = wandb.Artifact(artifact_name, type="evaluation")
             arti.add_file(report_path)
             log_path = os.path.join(eval_dir, "log.txt")
             if os.path.exists(log_path):
@@ -417,11 +428,13 @@ def main():
     parser.add_argument("--test_guidance_scales", type=float, nargs="+", default=[7.0], help="List of CFG scales to test.")
     parser.add_argument("--save_ratio", type=float, default=0.1, help="Ratio of outputs to save randomly (e.g., 0.1 saves 10%).")
     parser.add_argument("--tokens_diff", action="store_true", help="Whether to save intermediate token differences for debugging.")
+    parser.add_argument("--curvature", action="store_true", help="Whether to save intermediate curvature metrics for debugging.")
+    parser.add_argument("--entropy", action="store_true", help="Whether to save intermediate shanon entropy for debugging.")
     parser.add_argument("--save_intermediates", action="store_true", help="Whether to save intermediate meshes and renderings during generation.")
     parser.add_argument("--offline_wandb", action="store_true", help="Use offline WandB for experiment tracking")
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB for experiment tracking")
     parser.add_argument("--analyze_sensitivity", action="store_true", help="Enable gradient sensitivity analysis")
-    parser.add_argument("--gradient_analysis_method", type=str, default="gradient_norm", choices=["gradient_norm"], help="Method for gradient sensitivity analysis")
+    parser.add_argument("--gradient_analysis_method", type=str,nargs="+", default=["gradient_norm"], choices=["gradient_norm", "fisher", "weight_gradient"], help="Method for gradient sensitivity analysis")
     
     args, extras = parser.parse_known_args()
     configs = get_configs(args.config, extras)
@@ -439,7 +452,8 @@ def main():
     max_num_samples = configs.dataset.get("max_num_samples", "all")
     num_tokens = configs.model.vae.num_tokens
     num_inference_steps = configs.test.num_inference_steps
-    args.tag = f"{args.tag}/num_tokens_{num_tokens}/max_samples_{max_num_samples}/diffusion_steps_{num_inference_steps}/{precisions}"
+    dataset = configs.dataset.config[0].split("/")[-2]
+    args.tag = f"{dataset}_{max_num_samples}/num_tokens_{num_tokens}/diffusion_steps_{num_inference_steps}/{precisions}/{args.tag}"
     args.wandb_tag = args.tag.replace("/", "_")  # For cleaner WandB tags
     eval_dir = os.path.join(args.output_dir, f"{args.tag}/{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(eval_dir, exist_ok=True)
