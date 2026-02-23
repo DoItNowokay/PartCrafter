@@ -1,5 +1,11 @@
 """
-Utilities for gradient analysis and sensitivity testing.
+Layer-wise sensitivity analyzer for quantization.
+Supports multiple methods simultaneously:
+    - gradient_norm
+    - fisher
+    - weight_gradient
+    - fake_quant
+    - noise_amplification
 """
 
 import os
@@ -10,35 +16,90 @@ import torch.nn as nn
 
 
 class GradientSensitivityAnalyzer:
-    def __init__(self, method="gradient_norm"):
-        self.results = defaultdict(lambda: defaultdict(list))
-        # We store raw timesteps just for reference, but we will plot by index
+    def __init__(self, methods=None, quant_bits=8, noise_std=1e-3):
+        """
+        methods: list of str
+        quant_bits: int (for fake quant)
+        noise_std: float (for noise amplification)
+        """
+
+        if methods is None:
+            methods = ["gradient_norm"]
+
+        self.methods = methods
+        self.quant_bits = quant_bits
+        self.noise_std = noise_std
+
+        self.results = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
+        )
+
         self.timesteps_recorded = []
-        self.method = method
         self.output_dir = None
 
+    # ---------------------------------------------------
+    # Reset
+    # ---------------------------------------------------
     def reset_for_new_step(self, output_dir):
-        """
-        Resets results and points to the current object's folder.
-        output_dir example: .../gs_7.0/step_0001/
-        """
-        self.results = defaultdict(lambda: defaultdict(list))
+        self.results = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
+        )
         self.timesteps_recorded = []
         self.output_dir = output_dir
 
-    def analyze_step(self, model, latents, t, encoder_hidden_states, text_pooled, text_hidden_states, attention_kwargs, do_classifier_free_guidance):
-        """
-        Runs a shadow forward/backward pass to record gradient norms.
-        """
-        if self.method != "gradient_norm":
-            return
+    # ---------------------------------------------------
+    # Fake Quantization
+    # ---------------------------------------------------
+    def fake_quantize(self, weight):
+        qmax = 2 ** (self.quant_bits - 1) - 1
+        scale = weight.abs().max() / qmax + 1e-8
+        q_weight = torch.round(weight / scale) * scale
+        return q_weight
 
-        # 1. Shadow Forward Pass with Gradients Enabled
+    # ---------------------------------------------------
+    # Gradient-based scores
+    # ---------------------------------------------------
+    def compute_gradient_scores(self, layer):
+        if layer.weight.grad is None:
+            return None
+
+        scores = {}
+        grad = layer.weight.grad
+        weight = layer.weight
+
+        if "gradient_norm" in self.methods:
+            scores["gradient_norm"] = grad.norm(2).item()
+
+        if "fisher" in self.methods:
+            scores["fisher"] = grad.pow(2).mean().item()
+
+        if "weight_gradient" in self.methods:
+            scores["weight_gradient"] = (weight * grad).abs().mean().item()
+
+        return scores
+
+    # ---------------------------------------------------
+    # Main Analysis Step
+    # ---------------------------------------------------
+    def analyze_step(
+        self,
+        model,
+        latents,
+        t,
+        encoder_hidden_states,
+        text_pooled,
+        text_hidden_states,
+        attention_kwargs,
+        do_classifier_free_guidance,
+    ):
+
+        # -------------------------
+        # 1️⃣ Forward pass (clean)
+        # -------------------------
         with torch.enable_grad():
             model.zero_grad()
 
-            # Forward pass to build the graph
-            output = model(
+            clean_output = model(
                 hidden_states=latents,
                 timestep=t,
                 encoder_hidden_states=encoder_hidden_states,
@@ -48,90 +109,229 @@ class GradientSensitivityAnalyzer:
                 return_dict=True
             ).sample
 
-            # 2. Identify the Conditional Output
             if do_classifier_free_guidance:
-                output_conditional = output.chunk(2)[1]
-            else:
-                output_conditional = output
+                clean_output = clean_output.chunk(2)[1]
 
             num_parts = attention_kwargs.get("num_parts", 1)
 
-            # 3. Part-Wise Backward Pass
             for part_idx in range(num_parts):
                 model.zero_grad()
 
-                # Isolate output for this specific part
-                part_output = output_conditional[part_idx].unsqueeze(0)
-
-                # Proxy Loss: Norm of the output
+                part_output = clean_output[part_idx].unsqueeze(0)
                 loss = part_output.norm()
-
-                # Backward Pass
                 loss.backward(retain_graph=True)
 
-                # Record Gradients for ALL Linear layers
                 for name, layer in model.named_modules():
-                    if isinstance(layer, nn.Linear) and layer.weight.grad is not None:
-                        grad_norm = layer.weight.grad.norm(2).item()
-                        self.results[part_idx][name].append(grad_norm)
+                    if isinstance(layer, nn.Linear):
 
-            del output
+                        grad_scores = self.compute_gradient_scores(layer)
+                        if grad_scores:
+                            for m, val in grad_scores.items():
+                                self.results[m][part_idx][name].append(val)
 
-        # Record the raw timestep for debugging, but we plot by call count
+            if "fake_quant" in self.methods or "noise_amplification" in self.methods:
+
+                with torch.no_grad():
+
+                    for name, layer in model.named_modules():
+                        if not isinstance(layer, nn.Linear):
+                            continue
+
+                        original_weight = layer.weight.data.clone()
+
+                        # Fake Quant
+                        if "fake_quant" in self.methods:
+                            layer.weight.data = self.fake_quantize(original_weight)
+
+                            quant_output = model(
+                                hidden_states=latents,
+                                timestep=t,
+                                encoder_hidden_states=encoder_hidden_states,
+                                text_pooled=text_pooled,
+                                text_hidden_states=text_hidden_states,
+                                attention_kwargs=attention_kwargs,
+                                return_dict=True
+                            ).sample
+
+                            if do_classifier_free_guidance:
+                                quant_output = quant_output.chunk(2)[1]
+
+                            diff = (clean_output - quant_output).norm().item()
+
+                            for part_idx in range(num_parts):
+                                self.results["fake_quant"][part_idx][name].append(diff)
+
+                        # Noise Amplification
+                        if "noise_amplification" in self.methods:
+                            noise = torch.randn_like(original_weight) * self.noise_std
+                            layer.weight.data = original_weight + noise
+
+                            noisy_output = model(
+                                hidden_states=latents,
+                                timestep=t,
+                                encoder_hidden_states=encoder_hidden_states,
+                                text_pooled=text_pooled,
+                                text_hidden_states=text_hidden_states,
+                                attention_kwargs=attention_kwargs,
+                                return_dict=True
+                            ).sample
+
+                            if do_classifier_free_guidance:
+                                noisy_output = noisy_output.chunk(2)[1]
+
+                            amplification = (
+                                (noisy_output - clean_output).norm() /
+                                (noise.norm() + 1e-8)
+                            ).item()
+
+                            for part_idx in range(num_parts):
+                                self.results["noise_amplification"][part_idx][name].append(amplification)
+
+                        # Restore
+                        layer.weight.data = original_weight
+
+            del clean_output
+
         self.timesteps_recorded.append(t[0].item())
 
+
     def plot_results(self):
-        """
-        Saves one plot per layer into the step folder.
-        Uses Step Index (0...N) for X-axis.
-        """
+
         if not self.output_dir:
             return
 
-        save_dir = os.path.join(self.output_dir, self.method)
-        os.makedirs(save_dir, exist_ok=True)
-
-        recorded_parts = sorted(list(self.results.keys()))
-        if not recorded_parts:
-            return
-
-        reference_part = recorded_parts[0]
-        available_layers = list(self.results[reference_part].keys())
-        colormap = plt.get_cmap('tab10')
-
-        # Generate X-axis based on how many steps actually ran
-        # This will be [0, 1, 2, ... 49] if num_inference_steps=50
         num_steps_ran = len(self.timesteps_recorded)
         steps_axis = list(range(num_steps_ran))
+        colormap = plt.get_cmap('tab10')
 
-        for name in available_layers:
-            plt.figure(figsize=(10, 6))
-            has_data = False
+        for method in self.methods:
 
-            for i, part_idx in enumerate(recorded_parts):
-                values = self.results[part_idx][name]
-                if not values: continue
-                has_data = True
+            save_dir = os.path.join(self.output_dir, method)
+            os.makedirs(save_dir, exist_ok=True)
 
-                plt.plot(steps_axis, values,
-                         label=f"Part {part_idx}",
-                         marker='.', markersize=3, linewidth=1.0,
-                         color=colormap(i % 10), alpha=0.8)
-
-            if not has_data:
-                plt.close()
+            recorded_parts = sorted(list(self.results[method].keys()))
+            if not recorded_parts:
                 continue
 
-            plt.title(f"Sensitivity: {name}")
-            plt.xlabel(f"Timestep") # Explicitly shows 0-50 logic
-            plt.ylabel("Gradient Norm")
+            reference_part = recorded_parts[0]
+            available_layers = list(self.results[method][reference_part].keys())
 
-            # NOTE: We do NOT invert axis here. Step 0 is start, Step 50 is finish.
+            for name in available_layers:
+                plt.figure(figsize=(10, 6))
+                has_data = False
 
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            plt.tight_layout()
+                for i, part_idx in enumerate(recorded_parts):
+                    values = self.results[method][part_idx][name]
+                    if not values:
+                        continue
 
-            safe_layer_name = name.replace(".", "_")
-            plt.savefig(os.path.join(save_dir, f"{safe_layer_name}.png"))
-            plt.close()
+                    has_data = True
+
+                    plt.plot(
+                        steps_axis,
+                        values,
+                        label=f"Part {part_idx}",
+                        marker='.',
+                        markersize=3,
+                        linewidth=1.0,
+                        color=colormap(i % 10),
+                        alpha=0.8
+                    )
+
+                if not has_data:
+                    plt.close()
+                    continue
+
+                plt.title(f"{method} Sensitivity: {name}")
+                plt.xlabel("Timestep")
+                plt.ylabel("Score")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                plt.tight_layout()
+
+                # --------------------------------------------------
+                # Custom block folder logic
+                # --------------------------------------------------
+
+                parts = name.split(".")
+
+                save_path = None
+
+                if len(parts) >= 3 and parts[0] == "blocks":
+                    # blocks.3.attn2.to_q
+                    block_id = parts[1]
+                    block_folder = f"block{block_id}"
+
+                    block_path = os.path.join(save_dir, block_folder)
+                    os.makedirs(block_path, exist_ok=True)
+
+                    # Remove blocks.<id>.
+                    remaining_name = "_".join(parts[2:])
+                    save_path = os.path.join(block_path, f"{remaining_name}.png")
+
+                else:
+                    # No block prefix → save normally
+                    safe_name = name.replace(".", "_")
+                    save_path = os.path.join(save_dir, f"{safe_name}.png")
+
+                plt.savefig(save_path)
+                plt.close()
+                
+    def plot_mixed_precision_allocation(self, method="fisher"):
+
+        if method not in self.results:
+            print(f"Method {method} not found.")
+            return
+
+        if not self.results[method]:
+            print("No results recorded.")
+            return
+
+        import numpy as np
+
+        # Use first part (single object case)
+        part_idx = sorted(self.results[method].keys())[0]
+
+        layer_scores = {}
+
+        # Aggregate mean over timesteps
+        for layer_name, values in self.results[method][part_idx].items():
+            if len(values) > 0:
+                layer_scores[layer_name] = np.mean(values)
+
+        if len(layer_scores) == 0:
+            print("No layer scores available.")
+            return
+
+        # Sort layers by sensitivity (descending)
+        sorted_layers = sorted(layer_scores.items(),
+                               key=lambda x: x[1],
+                               reverse=True)
+
+        layers = [x[0] for x in sorted_layers]
+        scores = [x[1] for x in sorted_layers]
+
+        n = len(layers)
+
+        fp16_cutoff = int(0.2 * n)
+        int8_cutoff = int(0.6 * n)
+
+        plt.figure(figsize=(12, 6))
+        plt.bar(range(n), scores)
+
+        plt.axvline(fp16_cutoff, linestyle='--')
+        plt.axvline(int8_cutoff, linestyle='--')
+
+        plt.title("Sensitivity-Guided Mixed Precision Allocation")
+        plt.xlabel("Layer Rank (High → Low Sensitivity)")
+        plt.ylabel(f"{method} Score")
+
+        plt.tight_layout()
+
+        save_path = os.path.join(self.output_dir,
+                                 f"mixed_precision_allocation_{method}.png")
+        plt.savefig(save_path)
+        plt.close()
+
+        print(f"Mixed precision plot saved to: {save_path}")
+

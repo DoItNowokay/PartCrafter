@@ -240,7 +240,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         use_flash_decoder: bool = True,
         return_dict: bool = True,
         save_intermediates: bool = False,
-        save_tokens_diff: bool = False,
+        save_token_diff: bool = False,
         save_curvature: bool = False,
         save_entropy: bool = False,
         save_intermediate_dir: Optional[str] = None,
@@ -345,7 +345,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             ncols=125,
             disable=self._progress_bar_config['disable'] if hasattr(self, '_progress_bar_config') else False,
         )
-        track_token_diffs = save_tokens_diff or collect_dynamics_stats
+        track_token_diffs = save_token_diff or collect_dynamics_stats
         track_curvature = save_curvature or collect_dynamics_stats
         diffs_per_part = [[ ] for _ in range(batch_size)] if track_token_diffs else None
         curvature_per_part = [[ ] for _ in range(batch_size)] if track_curvature else None
@@ -536,11 +536,11 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 progress_bar.update()
                 
         # Plot diffs and/or curvature if intermediates were computed
-        if (save_tokens_diff or save_curvature or save_entropy) and save_intermediate_dir:
+        if (save_token_diff or save_curvature or save_entropy) and save_intermediate_dir:
             os.makedirs(save_intermediate_dir, exist_ok=True)
             import matplotlib.pyplot as plt
             
-            if save_tokens_diff and save_curvature and save_entropy:
+            if save_token_diff and save_curvature and save_entropy:
                 # Plot all three
                 fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 15))
                 for p in range(batch_size):
@@ -570,7 +570,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 plt.tight_layout()
                 plt.savefig(os.path.join(save_intermediate_dir, "token_diff_curvature_shanon_entropy.png"))
                 plt.close()
-            elif save_tokens_diff and save_curvature:
+            elif save_token_diff and save_curvature:
                 # Plot both in subplots
                 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
                 for p in range(batch_size):
@@ -592,7 +592,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 plt.tight_layout()
                 plt.savefig(os.path.join(save_intermediate_dir, "token_diff_and_curvature.png"))
                 plt.close()
-            elif save_tokens_diff and save_entropy:
+            elif save_token_diff and save_entropy:
                 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
                 for p in range(batch_size):
                     ax1.plot(diffs_per_part[p], label=f'Part {p:02d}')
@@ -634,7 +634,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 plt.tight_layout()
                 plt.savefig(os.path.join(save_intermediate_dir, "curvature_and_shanon_entropy.png"))
                 plt.close()
-            elif save_tokens_diff:
+            elif save_token_diff:
                 plt.figure(figsize=(10, 6))
                 for p in range(batch_size):
                     plt.plot(diffs_per_part[p], label=f'Part {p:02d}')

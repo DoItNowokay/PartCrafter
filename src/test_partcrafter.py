@@ -5,6 +5,8 @@ Test script for evaluating PartCrafter model on part segmentation and generation
 import warnings
 warnings.filterwarnings("ignore")
 import diffusers.utils.logging as diffusion_logging
+from diffusers import PipelineQuantizationConfig
+from diffusers import BitsAndBytesConfig as DiffusersBnbConfig
 diffusion_logging.set_verbosity_error()
 
 import sys
@@ -49,7 +51,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger as get_accelerate_logger
 from torchvision import transforms
 
-from transformers import BitImageProcessor, Dinov2Model
+from transformers import BitImageProcessor, Dinov2Model, BitsAndBytesConfig
 from src.schedulers import RectifiedFlowScheduler
 from src.models.autoencoders import TripoSGVAEModel
 from src.models.transformers import PartCrafterDiTModel
@@ -278,7 +280,7 @@ def run_evaluation(
             )
             start_time = time.time()
             save_intermediates = accelerator.is_main_process and args.save_intermediates and save_iteration
-            log_tokens_diff = accelerator.is_main_process and args.tokens_diff and save_iteration
+            log_token_diff = accelerator.is_main_process and args.token_diff and save_iteration
             log_curvature = accelerator.is_main_process and args.curvature and save_iteration
             log_entropy = accelerator.is_main_process and args.entropy and save_iteration
             save_intermediate_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
@@ -297,7 +299,7 @@ def run_evaluation(
                     max_num_expanded_coords=configs['test']['max_num_expanded_coords'],
                     use_flash_decoder=configs['test']['use_flash_decoder'],
                     save_intermediates=save_intermediates,
-                    save_tokens_diff=log_tokens_diff,
+                    save_token_diff=log_token_diff,
                     save_curvature=log_curvature,
                     save_entropy=log_entropy,
                     save_intermediate_dir=save_intermediate_dir, 
@@ -308,6 +310,7 @@ def run_evaluation(
             
             if analyzer:
                 analyzer.plot_results()
+                analyzer.plot_mixed_precision_allocation(method="gradient_norm")
 
             pred_part_meshes = output.meshes
             end_time = time.time()
@@ -533,14 +536,14 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers. Set to 0 to avoid I/O bottlenecks.")
     parser.add_argument("--test_guidance_scales", type=float, nargs="+", default=[7.0], help="List of CFG scales to test.")
     parser.add_argument("--save_ratio", type=float, default=0.1, help="Ratio of outputs to save randomly (e.g., 0.1 saves 10%).")
-    parser.add_argument("--tokens_diff", action="store_true", help="Whether to save intermediate token differences for debugging.")
+    parser.add_argument("--token_diff", action="store_true", help="Whether to save intermediate token differences for debugging.")
     parser.add_argument("--curvature", action="store_true", help="Whether to save intermediate curvature metrics for debugging.")
     parser.add_argument("--entropy", action="store_true", help="Whether to save intermediate shanon entropy for debugging.")
     parser.add_argument("--save_intermediates", action="store_true", help="Whether to save intermediate meshes and renderings during generation.")
     parser.add_argument("--offline_wandb", action="store_true", help="Use offline WandB for experiment tracking")
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB for experiment tracking")
     parser.add_argument("--analyze_sensitivity", action="store_true", help="Enable gradient sensitivity analysis")
-    parser.add_argument("--gradient_analysis_method", type=str,nargs="+", default=["gradient_norm"], choices=["gradient_norm", "fisher", "weight_gradient"], help="Method for gradient sensitivity analysis")
+    parser.add_argument("--gradient_analysis_method", type=str,nargs="+", default=["gradient_norm"], choices=["gradient_norm", "fisher", "noise_amplification"], help="Method for gradient sensitivity analysis")
     parser.add_argument("--token_diff_threshold", type=float, default=0.008, help="Delta z_t threshold used to trigger valley-phase bit allocation.")
     parser.add_argument("--curvature_spike_threshold", type=float, default=0.12, help="Curvature threshold for Anchor vs Diffuse bit assignment.")
     parser.add_argument("--abw_high_bit_ratio", type=float, default=0.1, help="Ratio of weights kept at the high bit-width when computing ABW.")
@@ -554,7 +557,11 @@ def main():
 
     precisions = ""
     for prec in configs.test.bit_precision:
-        if prec == "fp16":
+        if prec == "fp4":
+            precisions += "fp4_"
+        elif prec == "fp8":
+            precisions += "fp8_"
+        elif prec == "fp16":
             precisions += "fp16_"
         elif prec == "bf16":
             precisions += "bf16_"
@@ -598,17 +605,50 @@ def main():
     rmbg_net.eval() 
 
     logger.info(f"Loading base models from: {partcrafter_weights_dir}")
-    # set weight dtype based on config
-    assert len(configs.test.bit_precision) == 1, "Only single precision supported for testing as of now."
-    if configs.test.bit_precision[0] == "fp32":
+    precision = configs.test.bit_precision[0]
+    quantization_config = None
+    weight_dtype = torch.float16 # Default compute type
+    if precision == "fp32":
         weight_dtype = torch.float32
-    elif configs.test.bit_precision[0] == "fp16":
-        weight_dtype = torch.float16    
+    elif precision == "fp16":
+        weight_dtype = torch.float16
+    elif precision == "fp8":
+        quantization_config = DiffusersBnbConfig(load_in_8bit=True)
+    elif precision == "fp4":
+        quantization_config = DiffusersBnbConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_device_map="auto", # Note the bnb_ prefix here
+            bnb_4bit_quant_type="nf4",
+        )
     else:
         raise ValueError(f"Unsupported precision: {configs.test.bit_precision[0]}")
 
-    pipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir, torch_dtype=weight_dtype)
-    pipeline.to(accelerator.device, weight_dtype)
+
+    if quantization_config:
+        transformer = PartCrafterDiTModel.from_pretrained(
+            partcrafter_weights_dir,
+            subfolder="transformer",
+            quantization_config=quantization_config,
+            torch_dtype=weight_dtype,
+        )
+    else:
+        transformer = PartCrafterDiTModel.from_pretrained(
+            partcrafter_weights_dir,
+            subfolder="transformer",
+            torch_dtype=weight_dtype,
+        )
+    # pipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir, torch_dtype=weight_dtype)
+    pipeline = PartCrafterPipeline.from_pretrained(
+        partcrafter_weights_dir, 
+        transformer=transformer,
+        torch_dtype=weight_dtype,
+        device_map="balanced" if quantization_config else None,
+        # device_map="balanced" # Required for bitsandbytes to place shards correctly
+    )
+    # pipeline.to(accelerator.device, weight_dtype)
+    if quantization_config is None:
+        pipeline.to(accelerator.device, weight_dtype)
     pipeline.set_progress_bar_config(disable=True)
 
     set_seed(args.seed)
