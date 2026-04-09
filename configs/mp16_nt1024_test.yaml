@@ -14,7 +14,8 @@ dataset:
     # Modify this path to point to your test dataset configuration
     # - "preprocessed_data/objaverse/hf-objaverse-v1/glbs/object_part_configs.json"
     # - "preprocessed_data/object_part_configs.json"
-    - "/scratch/ab_anoushkrit/DATA/PartCrafter/preprocessed_data/abo/object_part_configs.json"
+    # - "/scratch/ab_anoushkrit/DATA/PartCrafter/preprocessed_data/abo/object_part_configs.json"
+    - "/data1/simroop/DATA/PartCrafter/preprocessed_data/object_part_configs.json"
   # Specify the 'test' split for evaluation
   split: "test" 
   min_num_parts: 1
@@ -26,7 +27,7 @@ dataset:
   object_ratio: 0.3
   rotating_ratio: 0.2
   ratating_degree: 10
-  max_num_samples: 1
+  max_num_samples: 99
 
 test:
   batch_size_per_gpu: 1

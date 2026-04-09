@@ -6,3 +6,5 @@ pretrained_weights
 results
 output_partcrafter*
 evaluation
+result_plots
+pretrained_models

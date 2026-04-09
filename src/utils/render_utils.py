@@ -142,7 +142,6 @@ def _pytorch3d_render(
     image = (image * 255).astype(np.uint8)
 
     return image
-# ... [Keep the rest of the helper functions: rotation_matrix_from_vectors, create_circular_camera_positions, etc.] ...
 
 def rotation_matrix_from_vectors(vec1, vec2):
     a, b = vec1 / np.linalg.norm(vec1), vec2 / np.linalg.norm(vec2)
