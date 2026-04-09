@@ -255,7 +255,8 @@ def run_evaluation(
         
         for guidance_scale in sorted(args.test_guidance_scales):
             save_intermediates = accelerator.is_main_process and args.save_intermediates
-            save_tokens_diff = accelerator.is_main_process and args.tokens_diff
+            save_token_diff = accelerator.is_main_process and args.token_diff
+            save_curvature = accelerator.is_main_process and args.curvature
             
             local_eval_dir = os.path.join(eval_dir, f"gs_{guidance_scale:.1f}", f"step_{step:04d}")
 
@@ -274,7 +275,8 @@ def run_evaluation(
                     max_num_expanded_coords=configs['test']['max_num_expanded_coords'],
                     use_flash_decoder=configs['test']['use_flash_decoder'],
                     save_intermediates=save_intermediates,
-                    save_tokens_diff=save_tokens_diff,
+                    save_token_diff=save_token_diff,
+                    save_curvature=save_curvature,
                     save_intermediate_dir=local_eval_dir, 
                     configs=configs,
                     analyzer=analyzer 
@@ -334,7 +336,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0, help="Workers")
     parser.add_argument("--test_guidance_scales", type=float, nargs="+", default=[7.0], help="CFG scales")
     parser.add_argument("--save_ratio", type=float, default=0.1, help="Save ratio")
-    parser.add_argument("--tokens_diff", action="store_true", help="Save token diffs")
+    parser.add_argument("--token_diff", action="store_true", help="Save token diffs")
+    parser.add_argument("--curvature", action="store_true", help="Save curvature metrics")
     parser.add_argument("--save_intermediates", action="store_true", help="Save intermediates")
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB")
     parser.add_argument("--offline_wandb", action="store_true", help="Offline WandB")

@@ -61,4 +61,4 @@ test:
     - latency_seconds
     - peak_vram_gb
     - token_throughput
-  bit_precision: ["fp16"]
+  bit_precision: ["fp32"]
