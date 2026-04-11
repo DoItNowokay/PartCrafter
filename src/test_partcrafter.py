@@ -25,6 +25,7 @@ from src.utils.render_utils import (
     save_mesh_and_renderings
 )
 from src.utils.data_utils import get_colored_mesh_composition
+from src.utils.qdit_utils import apply_qdit_to_model
 
 # Standard library
 import argparse
@@ -178,6 +179,7 @@ def run_evaluation(
     object_level_metrics: List[Dict[str, Any]] = []
     num_timesteps = configs["test"]["num_inference_steps"]
     num_tokens = configs["model"]["vae"]["num_tokens"]
+    bit_width = configs.get('bit_width', 16)
     test_cfg = configs["test"]
     csv_fieldnames = None
     if hasattr(test_cfg, "get"):
@@ -208,6 +210,12 @@ def run_evaluation(
         # logger.info(f"Initializing Gradient Sensitivity Analyzer (Method: {args.gradient_analysis_method})")
         analyzer = GradientSensitivityAnalyzer(methods=args.gradient_analysis_method)
         pipeline.transformer.requires_grad_(True)
+
+    # Initialize lists for aggregate metrics
+    latencies = []
+    bops_list = []
+    abw_weights_list = []
+    abw_activations_list = []
 
     progress_bar = tqdm(
         enumerate(dataloader),
@@ -406,12 +414,16 @@ def run_evaluation(
                 args.total_inference_gflops,
                 num_timesteps,
             )
-            abw_weights_bits = compute_abw_weights(
-                args.abw_high_bit_ratio,
-                args.abw_high_bit_width,
-                args.abw_low_bit_width,
-            )
-            abw_activations_bits = float(np.mean(a_schedule)) if a_schedule else 0.0
+            if args.quant_method == 'none':
+                abw_weights_bits = float(bit_width)
+                abw_activations_bits = float(bit_width)
+            else:
+                abw_weights_bits = compute_abw_weights(
+                    args.abw_high_bit_ratio,
+                    args.abw_high_bit_width,
+                    args.abw_low_bit_width,
+                )
+                abw_activations_bits = float(np.mean(a_schedule)) if a_schedule else 0.0
             
             metrics_summary[guidance_scale]["chamfer"].extend(batch_cds)
             metrics_summary[guidance_scale]["f1_score"].extend(batch_f_scores)
@@ -454,7 +466,7 @@ def run_evaluation(
             if accelerator.is_main_process and (not args.no_wandb):
                 item_logs = {
                     f"evaluation/cd_cfg{guidance_scale:.1f}": float(np.mean(batch_cds)),
-                    f"evaluation/f1_cfg{guidance_scale:.1f}": float(np.mean(batch_f_scores)),
+                    f"evaluation/f1_cfg{guidance_scale:.1f}": float(np.nanmean(batch_f_scores)),
                     f"evaluation/iou_cfg{guidance_scale:.1f}": IoU if IoU is not None else float('nan'),
                     "evaluation/num_parts": int(num_parts),
                 }
@@ -463,14 +475,24 @@ def run_evaluation(
             if accelerator.is_main_process and args.save_ratio > 0 and save_iteration:
                 save_outputs(local_eval_dir, pred_part_meshes, input_image_pil, configs, args, guidance_scale, step, logger)
             
+        # Collect metrics for aggregation
+        latencies.append(generation_time)
+        bops_list.append(bops_billions)
+        abw_weights_list.append(abw_weights_bits)
+        abw_activations_list.append(abw_activations_bits)
+    
+    # print(latencies)
     if accelerator.is_main_process:
+        # Compute aggregate metrics and save CSV
+        save_aggregate_metrics_csv(eval_dir, args.metrics_csv_name, latencies, bops_list, abw_weights_list, abw_activations_list, metrics_summary, logger)
+
         logger.info("\n" + "="*60 + "\n                 Evaluation Results Summary\n" + "="*60)
         report_path = os.path.join(eval_dir, "results.txt")
         with open(report_path, "w") as f:
             f.write("Evaluation Results Summary\n" + "="*60 + "\n")
             for guidance_scale, metrics in sorted(metrics_summary.items()):
                 avg_cd = np.mean(metrics["chamfer"])
-                avg_f1 = np.mean(metrics["f1_score"])
+                avg_f1 = np.nanmean(metrics["f1_score"])
                 log_msg = (
                     f"Guidance Scale: {guidance_scale:<4.1f} | "
                     f"Avg Chamfer Distance: {avg_cd:.4f} | "
@@ -489,7 +511,7 @@ def run_evaluation(
                         float(np.mean(metrics["chamfer"])) if len(metrics["chamfer"]) else float('nan')
                     ),
                     f"evaluation/avg_f1_cfg{guidance_scale:.1f}": (
-                        float(np.mean(metrics["f1_score"])) if len(metrics["f1_score"]) else float('nan')
+                        float(np.nanmean(metrics["f1_score"])) if len(metrics["f1_score"]) else float('nan')
                     ),
                     f"evaluation/avg_iou_cfg{guidance_scale:.1f}": (
                         float(np.mean([x for x in metrics["iou"] if x is not None])) if any(x is not None for x in metrics["iou"]) else float('nan')
@@ -505,16 +527,6 @@ def run_evaluation(
             if os.path.exists(log_path):
                 arti.add_file(log_path)
             wandb.log_artifact(arti)
-        if csv_rows:
-            csv_path = os.path.join(eval_dir, args.metrics_csv_name)
-            summary_rows = build_summary_rows(csv_rows, object_level_metrics)
-            fieldnames = list(csv_fieldnames or DEFAULT_CSV_FIELDS)
-            with open(csv_path, "w", newline="") as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                for row in csv_rows + summary_rows:
-                    writer.writerow({key: row.get(key, "") for key in fieldnames})
-            logger.info(f"Structured metrics saved to {csv_path}")
         
     # Save resource metrics to JSON for analysis
     resource_path = os.path.join(eval_dir, "resource_metrics.json")
@@ -550,10 +562,34 @@ def main():
     parser.add_argument("--abw_high_bit_width", type=int, default=16, help="High bit-width used for load-bearing weights.")
     parser.add_argument("--abw_low_bit_width", type=int, default=4, help="Low bit-width used for fill weights.")
     parser.add_argument("--total_inference_gflops", type=float, default=105.0, help="Total GFLOPs per full inference pass (used for BOPs).")
-    parser.add_argument("--metrics_csv_name", type=str, default="metrics.csv", help="Filename for the exported per-sample metrics table.")
+    parser.add_argument("--metrics_csv_name", type=str, default="baseline_ptq4dit_results.csv", help="Filename for the exported per-sample metrics table.")
+    parser.add_argument("--quant_method", type=str, choices=['none', 'ptq4dit', 'qdit', 'team-p'], default='none', help="Quantization method to use.")
+    parser.add_argument("--weight_bit", type=int, default=8, help="Weight bit width for quantization.")
+    parser.add_argument("--act_bit", type=int, default=8, help="Activation bit width for quantization.")
+    parser.add_argument('--wbits', type=int, default=16, choices=[4, 8, 16], help='Weight bits')
+    parser.add_argument('--abits', type=int, default=16, choices=[8, 16], help='Activation bits')
+    parser.add_argument('--qdit_method', type=str, default='max', choices=['max', 'mse'], help='Weight quant method')
+    parser.add_argument('--use_gptq', action='store_true', help='Use GPTQ for weight quantization')
+    parser.add_argument('--calib_data_path', type=str, default=None, help='Path to calibration data for GPTQ or static quant')
+    parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples')
+    
+    # Required by Q-DiT logic in modelutils.py
+    parser.add_argument('--weight_group_size', type=int, default=128)
+    parser.add_argument('--act_group_size', type=int, default=128)
+    parser.add_argument('--w_sym', action='store_true', help='Symmetric weight quantization')
+    parser.add_argument('--a_sym', action='store_true', help='Symmetric activation quantization')
+    parser.add_argument('--static', action='store_true', help='Use static activation quantization')
     
     args, extras = parser.parse_known_args()
     configs = get_configs(args.config, extras)
+
+    # Set CSV filename based on quantization method
+    if args.quant_method == 'none':
+        args.metrics_csv_name = "baseline_results.csv"
+    elif args.quant_method == 'ptq4dit':
+        args.metrics_csv_name = "baseline_ptq4dit_results.csv"
+    else:
+        args.metrics_csv_name = f"{args.quant_method}_results.csv"
 
     precisions = ""
     for prec in configs.test.bit_precision:
@@ -624,6 +660,9 @@ def main():
     else:
         raise ValueError(f"Unsupported precision: {configs.test.bit_precision[0]}")
 
+    bit_width = 32 if weight_dtype == torch.float32 else 16
+    configs['bit_width'] = bit_width
+
 
     if quantization_config:
         transformer = PartCrafterDiTModel.from_pretrained(
@@ -631,17 +670,46 @@ def main():
             subfolder="transformer",
             quantization_config=quantization_config,
             torch_dtype=weight_dtype,
+            quant_method=args.quant_method,
+            weight_bit=args.weight_bit,
+            act_bit=args.act_bit,
         )
     else:
         transformer = PartCrafterDiTModel.from_pretrained(
             partcrafter_weights_dir,
             subfolder="transformer",
             torch_dtype=weight_dtype,
+            quant_method=args.quant_method,
+            weight_bit=args.weight_bit,
+            act_bit=args.act_bit,
         )
+    vae = TripoSGVAEModel.from_pretrained(
+        partcrafter_weights_dir,
+        subfolder="vae",
+        torch_dtype=weight_dtype,
+        quant_method=args.quant_method,
+        weight_bit=args.weight_bit,
+        act_bit=args.act_bit,
+    )
+    
+    if args.quant_method == 'qdit':
+        if args.wbits < 16 or args.abits < 16:
+            print("Applying Q-DiT Post-Training Quantization...")
+            
+            # Pre-process group sizes as Q-DiT expects them in list form
+            num_layers = len(transformer.blocks)
+            args.weight_group_size = [args.weight_group_size] * num_layers
+            args.act_group_size = [args.act_group_size] * num_layers
+            
+            # Call your newly created function
+            device = accelerator.device
+            transformer = apply_qdit_to_model(transformer, args, device=device)
+        
     # pipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir, torch_dtype=weight_dtype)
     pipeline = PartCrafterPipeline.from_pretrained(
         partcrafter_weights_dir, 
         transformer=transformer,
+        vae=vae,
         torch_dtype=weight_dtype,
         device_map="balanced" if quantization_config else None,
         # device_map="balanced" # Required for bitsandbytes to place shards correctly

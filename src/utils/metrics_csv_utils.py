@@ -98,6 +98,20 @@ def compute_bops_from_schedule(
     return (macs_per_step * bits_product_sum) / 1e9
 
 
+def compute_bops_from_abw(
+    abw_weights_bits: float,
+    abw_activations_bits: float,
+    total_gflops: float,
+) -> float:
+    """
+    Compute BOPs (Bit-Operations) in billions using average bit-widths.
+    
+    Formula: BOPs = MACs * weight_bits * activation_bits
+    """
+    total_macs = total_gflops * 1e9
+    return (total_macs * abw_weights_bits * abw_activations_bits) / 1e9
+
+
 def compute_abw_weights(high_ratio: float, high_bits: int, low_bits: int) -> float:
     high_ratio = min(max(high_ratio, 0.0), 1.0)
     return high_ratio * high_bits + (1.0 - high_ratio) * low_bits

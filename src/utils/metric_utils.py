@@ -1,8 +1,10 @@
 from src.utils.typing_utils import *
 
+import os
 import trimesh
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+import csv
 
 import torch
 
@@ -220,6 +222,71 @@ def compute_IoU_for_scene(
         return ious
     else:
         raise ValueError("return_type must be 'iou' or 'iou_list'")
+
+
+def compute_pae(gt_part_surfaces, pred_part_meshes, num_samples=204800, threshold=0.1):
+    """
+    Compute Part Alignment Error (PAE) as the average Chamfer distance over parts.
+    
+    Args:
+        gt_part_surfaces: List of GT surface points (np.ndarray).
+        pred_part_surfaces: List of predicted surface points or meshes.
+        num_samples: Number of samples for distance computation.
+        threshold: Threshold for F-score (not used here).
+    
+    Returns:
+        float: Average Chamfer distance.
+    """
+    cd_list = []
+    for gt_surf, pred_mesh in zip(gt_part_surfaces, pred_part_meshes):
+        if pred_mesh is not None and len(pred_mesh.vertices) > 0:
+            cd, _ = compute_cd_and_f_score_in_training(gt_surf, pred_mesh, num_samples, threshold)
+            cd_list.append(cd)
+    if cd_list:
+        return np.mean(cd_list)
+    else:
+        return float('nan')
+
+
+def save_aggregate_metrics_csv(
+    eval_dir: str,
+    metrics_csv_name: str,
+    latencies: List[float],
+    bops_list: List[float],
+    abw_weights_list: List[float],
+    abw_activations_list: List[float],
+    metrics_summary: Dict,
+    logger
+):
+    # print("here")
+    if not latencies:
+        # print("here2")
+        return
+    avg_latency = np.mean(latencies)
+    avg_bops = np.mean(bops_list)
+    avg_abw_weights = np.mean(abw_weights_list)
+    avg_abw_activations = np.mean(abw_activations_list)
+    overall_cd = np.mean([cd for gs, metrics in metrics_summary.items() for cd in metrics["chamfer"]])
+    ious = [iou for gs, metrics in metrics_summary.items() for iou in metrics["iou"] if iou is not None]
+    overall_iou = np.mean(ious) if ious else float('nan')
+    overall_f1 = np.nanmean([f1 for gs, metrics in metrics_summary.items() for f1 in metrics["f1_score"]])
+    
+    row = {
+        "latency_seconds": avg_latency,
+        "bops_billions": avg_bops,
+        "abw_weights_bits": avg_abw_weights,
+        "abw_activations_bits": avg_abw_activations,
+        "iou": overall_iou,
+        "f_score": overall_f1,
+        "chamfer_distance": overall_cd,
+    }
+    fieldnames = ["latency_seconds", "bops_billions", "abw_weights_bits", "abw_activations_bits", "iou", "f_score", "chamfer_distance"]
+    csv_path = os.path.join(eval_dir, metrics_csv_name)
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(row)
+    logger.info(f"Aggregate metrics saved to {csv_path}")
 
 
 DEFAULT_CSV_FIELDS: List[str] = [

@@ -239,6 +239,7 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         flash_octree_depth: int = 9,
         use_flash_decoder: bool = True,
         return_dict: bool = True,
+        output_type: str = "mesh",
         save_intermediates: bool = False,
         save_token_diff: bool = False,
         save_curvature: bool = False,
@@ -502,6 +503,21 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                 ):
                     progress_bar.update()
 
+
+        if output_type == "latent":
+            # Offload all models
+            self.maybe_free_model_hooks()
+
+            if not return_dict:
+                return (latents,)
+
+            return PartCrafterPipelineOutput(
+                samples=latents,
+                meshes=None,
+                token_diffs=None,
+                curvature=None,
+                entropy=None,
+            )
 
         # 7. decoder mesh
         self.vae.set_flash_decoder()

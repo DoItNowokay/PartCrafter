@@ -16,12 +16,17 @@ class ObjaversePartEvalDataset(Dataset):
         self.configs = configs
         self.shuffle_parts = configs['dataset']['shuffle_parts']
         
+        self.min_num_parts = configs['dataset']['min_num_parts']
+        self.max_num_parts = configs['dataset']['max_num_parts']
+        
         json_config_path = self.configs['dataset']['config'][0]
         max_number_of_samples = self.configs['dataset'].get('max_num_samples', None)
         
         with open(json_config_path, 'r') as f:
             etadata = json.load(f)
         metadata = etadata
+        # Filter by num_parts
+        metadata = [item for item in metadata if self.min_num_parts <= item['num_parts'] <= self.max_num_parts]
         # for i in range(len(etadata)):
         #     if etadata[i]['num_parts'] > 1:
         #         if metadata is None:
