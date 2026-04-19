@@ -19,7 +19,7 @@ dataset:
   # Specify the 'test' split for evaluation
   split: "test" 
   min_num_parts: 1
-  max_num_parts: 10
+  max_num_parts: 8
   training_ratio: 0.9
   max_iou_mean: 0.5
   max_iou_max: 0.5
@@ -27,13 +27,13 @@ dataset:
   object_ratio: 0.3
   rotating_ratio: 0.2
   ratating_degree: 10
-  max_num_samples: 100
+  max_num_samples: 4
 
 test:
   batch_size_per_gpu: 1
   nrow: 4
   min_num_parts: 1
-  max_num_parts: 10
+  max_num_parts: 8
   num_inference_steps: 50
   max_num_expanded_coords: 1e9
   use_flash_decoder: false

@@ -89,24 +89,30 @@ def load_image(img_path, bg_color=None, rmbg_net=None, padding_ratio=0.1, device
         resize_transform = transforms.Resize((rgb_image_gpu.shape[1], rgb_image_gpu.shape[2]), antialias=True)
 
         # seg from rmbg
-        alpha_gpu_rmbg = rmbg(rgb_image_resized)
-        alpha_gpu_rmbg = alpha_gpu_rmbg.squeeze(0)
-        alpha_gpu_rmbg = resize_transform(alpha_gpu_rmbg)
-        ma, mi = alpha_gpu_rmbg.max(), alpha_gpu_rmbg.min()
-        alpha_gpu_rmbg = (alpha_gpu_rmbg - mi) / (ma - mi)
+        if rmbg_net is not None:
+            alpha_gpu_rmbg = rmbg(rgb_image_resized)
+            alpha_gpu_rmbg = alpha_gpu_rmbg.squeeze(0)
+            alpha_gpu_rmbg = resize_transform(alpha_gpu_rmbg)
+            ma, mi = alpha_gpu_rmbg.max(), alpha_gpu_rmbg.min()
+            alpha_gpu_rmbg = (alpha_gpu_rmbg - mi) / (ma - mi)
 
-        alpha_gpu = alpha_gpu_rmbg
-        
-        alpha_gpu_tmp = alpha_gpu * 255
-        alpha = alpha_gpu_tmp.to(torch.uint8).squeeze().cpu().numpy()
+            alpha_gpu = alpha_gpu_rmbg
+            
+            alpha_gpu_tmp = alpha_gpu * 255
+            alpha = alpha_gpu_tmp.to(torch.uint8).squeeze().cpu().numpy()
 
-        _, alpha = cv2.threshold(alpha, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        labeled_alpha = label(alpha)
-        cleaned_alpha = remove_small_objects(labeled_alpha, min_size=200)
-        cleaned_alpha = (cleaned_alpha > 0).astype(np.uint8)
-        alpha = cleaned_alpha * 255
-        alpha_gpu = torch.from_numpy(cleaned_alpha).to(device).float().unsqueeze(0)
-        x, y, w, h = find_bounding_box(alpha)
+            _, alpha = cv2.threshold(alpha, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+            labeled_alpha = label(alpha)
+            cleaned_alpha = remove_small_objects(labeled_alpha, min_size=200)
+            cleaned_alpha = (cleaned_alpha > 0).astype(np.uint8)
+            alpha = cleaned_alpha * 255
+            alpha_gpu = torch.from_numpy(cleaned_alpha).to(device).float().unsqueeze(0)
+            x, y, w, h = find_bounding_box(alpha)
+        else:
+            # No RMBG, assume full image is foreground
+            alpha_gpu = torch.ones(1, rgb_image_gpu.shape[1], rgb_image_gpu.shape[2], device=device)
+            alpha = (alpha_gpu * 255).to(torch.uint8).squeeze().cpu().numpy()
+            x, y, w, h = 0, 0, rgb_image_gpu.shape[2], rgb_image_gpu.shape[1]
 
     # If alpha is provided, the bounds of all foreground are used
     else: 

@@ -162,9 +162,14 @@ def compute_cd_and_f_score_in_training(
     metric: str = 'l2'
 ):
     gt_points = gt_surface[:, :3]
-    num_samples = max(num_samples, gt_points.shape[0])
-    gt_points = gt_points[np.random.choice(gt_points.shape[0], num_samples, replace=False)]
-    pred_points = sample_from_mesh(pred_mesh, num_samples)
+    if gt_points.shape[0] == 0:
+        raise ValueError("gt_surface has no points for Chamfer Distance computation")
+    if pred_mesh is None or len(pred_mesh.vertices) == 0:
+        raise ValueError("pred_mesh is empty for Chamfer Distance computation")
+
+    sampled_n = min(num_samples, gt_points.shape[0])
+    gt_points = gt_points[np.random.choice(gt_points.shape[0], sampled_n, replace=False)]
+    pred_points = sample_from_mesh(pred_mesh, sampled_n)
     min_1_to_2, min_2_to_1 = compute_mutual_nearest_distance(gt_points, pred_points, metric=metric)
     chamfer_dist = np.mean(min_2_to_1) + np.mean(min_1_to_2)
     precision_1 = np.mean((min_1_to_2 < threshold).astype(np.float32))

@@ -25,7 +25,6 @@ from src.utils.render_utils import (
     save_mesh_and_renderings
 )
 from src.utils.data_utils import get_colored_mesh_composition
-from src.utils.qdit_utils import apply_qdit_to_model
 
 # Standard library
 import argparse
@@ -407,6 +406,7 @@ def run_evaluation(
                 num_timesteps,
                 diff_threshold=args.token_diff_threshold,
                 curvature_threshold=args.curvature_spike_threshold,
+                trigger_metric=args.trigger_metric,
             )
             bops_billions = compute_bops_from_schedule(
                 w_schedule,
@@ -563,12 +563,16 @@ def main():
     parser.add_argument("--abw_low_bit_width", type=int, default=4, help="Low bit-width used for fill weights.")
     parser.add_argument("--total_inference_gflops", type=float, default=105.0, help="Total GFLOPs per full inference pass (used for BOPs).")
     parser.add_argument("--metrics_csv_name", type=str, default="baseline_ptq4dit_results.csv", help="Filename for the exported per-sample metrics table.")
-    parser.add_argument("--quant_method", type=str, choices=['none', 'ptq4dit', 'qdit', 'team-p'], default='none', help="Quantization method to use.")
+    parser.add_argument("--m1_fg_ratio", type=float, default=0.2, help="Ratio of foreground tokens for Point4Bit.")
+    parser.add_argument("--m2_weight_ratio", type=float, default=0.8, help="Ratio of key weight channels for Point4Bit.")
+    parser.add_argument("--quant_method", type=str, choices=['none', 'ptq4dit', 'qdit', 'team-p', 'point4bit'], default='none', help="Quantization method to use.")
     parser.add_argument("--weight_bit", type=int, default=8, help="Weight bit width for quantization.")
     parser.add_argument("--act_bit", type=int, default=8, help="Activation bit width for quantization.")
     parser.add_argument('--wbits', type=int, default=16, choices=[4, 8, 16], help='Weight bits')
     parser.add_argument('--abits', type=int, default=16, choices=[8, 16], help='Activation bits')
     parser.add_argument('--qdit_method', type=str, default='max', choices=['max', 'mse'], help='Weight quant method')
+    parser.add_argument('--m_intervals', type=int, default=16, help="Number of CDF intervals for Point4Bit.")
+    parser.add_argument('--masks_path', type=str, default=None, help="Path to key channel masks for Point4Bit.")
     parser.add_argument('--use_gptq', action='store_true', help='Use GPTQ for weight quantization')
     parser.add_argument('--calib_data_path', type=str, default=None, help='Path to calibration data for GPTQ or static quant')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples')
@@ -579,6 +583,9 @@ def main():
     parser.add_argument('--w_sym', action='store_true', help='Symmetric weight quantization')
     parser.add_argument('--a_sym', action='store_true', help='Symmetric activation quantization')
     parser.add_argument('--static', action='store_true', help='Use static activation quantization')
+    parser.add_argument("--trigger_metric", type=str, default="token_diff", 
+                    choices=["token_diff", "curvature"], 
+                    help="Metric to trigger precision changes in the 20-30 window.")
     
     args, extras = parser.parse_known_args()
     configs = get_configs(args.config, extras)
@@ -694,6 +701,7 @@ def main():
     
     if args.quant_method == 'qdit':
         if args.wbits < 16 or args.abits < 16:
+            from src.utils.qdit_utils import apply_qdit_to_model
             print("Applying Q-DiT Post-Training Quantization...")
             
             # Pre-process group sizes as Q-DiT expects them in list form
@@ -704,7 +712,28 @@ def main():
             # Call your newly created function
             device = accelerator.device
             transformer = apply_qdit_to_model(transformer, args, device=device)
+    
+    if args.quant_method == 'point4bit':
+        from src.utils.point4bit import Point4BitLinear
+        masks = torch.load(args.masks_path) if args.masks_path else {}
         
+        def replace_linear_with_point4bit(module, masks, layer_name_prefix=""):
+            for name, child in module.named_children():
+                full_name = f"{layer_name_prefix}.{name}" if layer_name_prefix else name
+                if isinstance(child, torch.nn.Linear):
+                    point4bit_layer = Point4BitLinear(
+                        child.in_features, child.out_features, fg_ratio=args.m1_fg_ratio, weight_ratio=args.m2_weight_ratio, high_bits=4, low_bits=4, bias=child.bias is not None, masks=masks.get(full_name)
+                    )
+                    point4bit_layer.weight.data = child.weight.data.clone()
+                    if child.bias is not None:
+                        point4bit_layer.bias.data = child.bias.data.clone()
+                    setattr(module, name, point4bit_layer)
+                    print(f"Replaced {full_name} with Point4BitLinear")
+                else:
+                    replace_linear_with_point4bit(child, masks, full_name)
+        
+        replace_linear_with_point4bit(transformer, masks)
+    
     # pipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir, torch_dtype=weight_dtype)
     pipeline = PartCrafterPipeline.from_pretrained(
         partcrafter_weights_dir, 
