@@ -25,8 +25,9 @@ from src.utils.render_utils import (
     save_mesh_and_renderings
 )
 from src.utils.data_utils import get_colored_mesh_composition
-from src.utils.qdit_utils import apply_qdit_to_model
-# from quantization.layers import compute_weight_sensitivity, Point4BitLinear
+
+# Import DeepCache helper
+from src.test_deepcache_partcrafter import DiTCacheHelper
 
 # Standard library
 import argparse
@@ -297,10 +298,36 @@ def run_evaluation(
             if analyzer:
                 analyzer.reset_for_new_step(save_intermediate_dir)
 
+            # Setup DeepCache if enabled
+            attention_kwargs = {"num_parts": num_parts}
+            if args.deepcache:
+                deepcache_helper = DiTCacheHelper(
+                    cache_interval=args.cache_interval,
+                    cache_branch_id=args.cache_branch_id,
+                    num_timesteps=configs['test']['num_inference_steps']
+                )
+                deepcache_helper.clear_cache()
+                attention_kwargs["deepcache_helper"] = deepcache_helper
+
+            w_tmp = [16] * num_timesteps
+            a_tmp = [16] * num_timesteps
+            
+            if args.trigger_metric == "token_diff":
+                for i in range(20, 30):
+                    w_tmp[i] = args.low_bit
+                    a_tmp[i] = args.low_bit
+            elif args.trigger_metric == "curvature":
+                for i in range(0, 10):
+                    w_tmp[i] = args.low_bit
+                    a_tmp[i] = args.low_bit
+                for i in range(40, num_timesteps):
+                    w_tmp[i] = args.low_bit
+                    a_tmp[i] = args.low_bit
+    
             with torch.no_grad():
                 output = pipeline(
                     [image_pil] * num_parts,
-                    attention_kwargs={"num_parts": num_parts},
+                    attention_kwargs=attention_kwargs,
                     num_tokens=configs['model']['vae']['num_tokens'],
                     generator=generator,
                     num_inference_steps=configs['test']['num_inference_steps'],
@@ -314,7 +341,10 @@ def run_evaluation(
                     save_intermediate_dir=save_intermediate_dir, 
                     collect_dynamics_stats=True,
                     configs=configs,
-                    analyzer=analyzer 
+                    analyzer=analyzer,
+                    w_bits_schedule=w_tmp,
+                    a_bits_schedule=a_tmp,
+                    
                 )
             
             if analyzer:
@@ -345,7 +375,6 @@ def run_evaluation(
                     pred_part_meshes[n] = trimesh.Trimesh(vertices=[[0, 0, 0]], faces=[[0, 0, 0]])
                 # pred_part_meshes[n].export(os.path.join(local_eval_dir, f"{n:02d}.glb"))
             batch_cds, batch_f_scores = [], []
-            batch_normal_consistencies = []
             for i in range(num_parts):
                 pred_mesh = pred_part_meshes[i]
                 gt_surface = gt_part_surfaces[i]
@@ -380,8 +409,6 @@ def run_evaluation(
                     part_cd = cd.cpu() if isinstance(cd, torch.Tensor) else torch.tensor(cd)
                     part_f = f_score.cpu() if isinstance(f_score, torch.Tensor) else torch.tensor(f_score)
                 
-                # normal_consistency = compute_normal_consistency(pred_mesh)
-                
                 if accelerator.is_main_process:
                     logger.info(
                         f"Step: {step:04d} | GS: {guidance_scale:<4.1f} | "
@@ -390,7 +417,6 @@ def run_evaluation(
 
                 batch_cds.append(part_cd.item())
                 batch_f_scores.append(part_f.item())
-                # batch_normal_consistencies.append(normal_consistency)
             
             # calculate IoU for the whole scene (merged mesh) if possible
             IoU = None
@@ -404,10 +430,8 @@ def run_evaluation(
 
             token_diffs = getattr(output, "token_diffs", None)
             curvature_traces = getattr(output, "curvature", None)
-            
             avg_token_diffs = aggregate_series(token_diffs, num_timesteps, offset=1, default_value=1.0)
             avg_curvatures = aggregate_series(curvature_traces, num_timesteps, offset=2, default_value=0.0)
-            
             w_schedule, a_schedule = assign_bitwidth_schedule(
                 avg_token_diffs,
                 avg_curvatures,
@@ -436,7 +460,6 @@ def run_evaluation(
             metrics_summary[guidance_scale]["chamfer"].extend(batch_cds)
             metrics_summary[guidance_scale]["f1_score"].extend(batch_f_scores)
             metrics_summary[guidance_scale]["iou"].append(IoU)
-            # metrics_summary[guidance_scale]["normal_consistency"].extend(batch_normal_consistencies)
 
             if accelerator.is_main_process:
                 scene_iou_value = float(IoU) if IoU is not None else float("nan")
@@ -462,7 +485,6 @@ def run_evaluation(
                         "part_index": part_idx,
                         "chamfer_distance": float(cd_value),
                         "fscore": float(f_value),
-                        # "normal_consistency": batch_normal_consistencies[part_idx],
                     })
                     csv_rows.append(row)
                 object_level_metrics.append({
@@ -470,7 +492,6 @@ def run_evaluation(
                     "part_index": "object",
                     "chamfer_distance": float(np.mean(batch_cds)) if batch_cds else float("nan"),
                     "fscore": float(np.mean(batch_f_scores)) if batch_f_scores else float("nan"),
-                    # "normal_consistency": float(np.mean(batch_normal_consistencies)) if batch_normal_consistencies else float("nan"),
                 })
 
             # Log per-item metrics/media to Weights & Biases (main process only)
@@ -479,7 +500,6 @@ def run_evaluation(
                     f"evaluation/cd_cfg{guidance_scale:.1f}": float(np.mean(batch_cds)),
                     f"evaluation/f1_cfg{guidance_scale:.1f}": float(np.nanmean(batch_f_scores)),
                     f"evaluation/iou_cfg{guidance_scale:.1f}": IoU if IoU is not None else float('nan'),
-                    f"evaluation/nc_cfg{guidance_scale:.1f}": float(np.mean(batch_normal_consistencies)),
                     "evaluation/num_parts": int(num_parts),
                 }
                 wandb.log(item_logs, step=step)
@@ -505,20 +525,11 @@ def run_evaluation(
             for guidance_scale, metrics in sorted(metrics_summary.items()):
                 avg_cd = np.mean(metrics["chamfer"])
                 avg_f1 = np.nanmean(metrics["f1_score"])
-                # avg_nc = _nanmean(metrics["normal_consistency"])
-                avg_iou = np.mean([x for x in metrics['iou'] if x is not None]) if any(x is not None for x in metrics['iou']) else float('nan')
-                avg_bops = np.mean(bops_list) if bops_list else 0.0
-                avg_abw_w = np.mean(abw_weights_list) if abw_weights_list else 0.0
-                avg_abw_a = np.mean(abw_activations_list) if abw_activations_list else 0.0
                 log_msg = (
                     f"Guidance Scale: {guidance_scale:<4.1f} | "
                     f"Avg Chamfer Distance: {avg_cd:.4f} | "
                     f"Avg F1-Score: {avg_f1:.4f} | "
-                    # f"Avg Normal Consistency: {avg_nc:.4f} | "
-                    f"IoU: {avg_iou:.4f} | "
-                    f"Avg BOPs: {avg_bops:.2f}B | "
-                    f"Avg ABW_W: {avg_abw_w:.2f} | "
-                    f"Avg ABW_A: {avg_abw_a:.2f}"
+                    f"IoU: {np.mean([x for x in metrics['iou'] if x is not None]) if any(x is not None for x in metrics['iou']) else float('nan'):.4f}"
                 )
                 logger.info(log_msg)
                 f.write(log_msg + "\n")
@@ -537,9 +548,6 @@ def run_evaluation(
                     f"evaluation/avg_iou_cfg{guidance_scale:.1f}": (
                         float(np.mean([x for x in metrics["iou"] if x is not None])) if any(x is not None for x in metrics["iou"]) else float('nan')
                     ),
-                    # f"evaluation/avg_nc_cfg{guidance_scale:.1f}": (
-                    #     # _nanmean(metrics["normal_consistency"]) if len(metrics["normal_consistency"]) else float('nan')
-                    # ),
                 })
             if aggregate_logs:
                 wandb.log(aggregate_logs)
@@ -587,14 +595,16 @@ def main():
     parser.add_argument("--abw_low_bit_width", type=int, default=4, help="Low bit-width used for fill weights.")
     parser.add_argument("--total_inference_gflops", type=float, default=105.0, help="Total GFLOPs per full inference pass (used for BOPs).")
     parser.add_argument("--metrics_csv_name", type=str, default="baseline_ptq4dit_results.csv", help="Filename for the exported per-sample metrics table.")
+    parser.add_argument("--m1_fg_ratio", type=float, default=0.2, help="Ratio of foreground tokens for Point4Bit.")
+    parser.add_argument("--m2_weight_ratio", type=float, default=0.8, help="Ratio of key weight channels for Point4Bit.")
     parser.add_argument("--quant_method", type=str, choices=['none', 'ptq4dit', 'qdit', 'team-p', 'point4bit'], default='none', help="Quantization method to use.")
-    parser.add_argument("--m1_fg_ratio", type=float, default=0.2, help="M1 foreground ratio for Point4Bit.")
-    parser.add_argument("--m2_weight_ratio", type=float, default=0.8, help="M2 weight ratio for Point4Bit.")
-    parser.add_argument("--m_intervals", type=int, default=2, help="Number of intervals for Point4Bit (default 2 for INT8, 3 for INT4).")
+    parser.add_argument("--weight_bit", type=int, default=8, help="Weight bit width for quantization.")
     parser.add_argument("--act_bit", type=int, default=8, help="Activation bit width for quantization.")
     parser.add_argument('--wbits', type=int, default=16, choices=[4, 8, 16], help='Weight bits')
     parser.add_argument('--abits', type=int, default=16, choices=[8, 16], help='Activation bits')
     parser.add_argument('--qdit_method', type=str, default='max', choices=['max', 'mse'], help='Weight quant method')
+    parser.add_argument('--m_intervals', type=int, default=16, help="Number of CDF intervals for Point4Bit.")
+    parser.add_argument('--masks_path', type=str, default=None, help="Path to key channel masks for Point4Bit.")
     parser.add_argument('--use_gptq', action='store_true', help='Use GPTQ for weight quantization')
     parser.add_argument('--calib_data_path', type=str, default=None, help='Path to calibration data for GPTQ or static quant')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples')
@@ -605,18 +615,18 @@ def main():
     parser.add_argument('--w_sym', action='store_true', help='Symmetric weight quantization')
     parser.add_argument('--a_sym', action='store_true', help='Symmetric activation quantization')
     parser.add_argument('--static', action='store_true', help='Use static activation quantization')
-    parser.add_argument("--trigger_metric", type=str, default="token_diff", 
-                    choices=["token_diff", "curvature"], 
+    parser.add_argument("--trigger_metric", type=str, default="none", 
+                    choices=["none","token_diff", "curvature"], 
                     help="Metric to trigger precision changes in the 20-30 window.")
+    
+    # DeepCache arguments
+    parser.add_argument("--deepcache", action="store_true", help="Enable DeepCache acceleration")
+    parser.add_argument("--cache_interval", type=int, default=2, help="DeepCache cache interval")
+    parser.add_argument("--cache_branch_id", type=int, default=0, help="DeepCache cache branch ID")
+    parser.add_argument("--low_bit", type=int, default=4, help="Low bit width for quantization")
+
     args, extras = parser.parse_known_args()
     configs = get_configs(args.config, extras)
-
-    # Set m_intervals based on weight_bit for point4bit
-    if args.quant_method == 'point4bit':
-        if args.weight_bit == 8:
-            args.m_intervals = 2
-        elif args.weight_bit == 4:
-            args.m_intervals = 3
 
     # Set CSV filename based on quantization method
     if args.quant_method == 'none':
@@ -706,9 +716,8 @@ def main():
             quantization_config=quantization_config,
             torch_dtype=weight_dtype,
             quant_method=args.quant_method,
-            m1_fg_ratio=args.m1_fg_ratio,
-            m2_weight_ratio=args.m2_weight_ratio,
-            m_intervals=args.m_intervals,
+            weight_bit=args.weight_bit,
+            act_bit=args.act_bit,
         )
     else:
         transformer = PartCrafterDiTModel.from_pretrained(
@@ -716,20 +725,21 @@ def main():
             subfolder="transformer",
             torch_dtype=weight_dtype,
             quant_method=args.quant_method,
-            m1_fg_ratio=args.m1_fg_ratio,
-            m2_weight_ratio=args.m2_weight_ratio,
-            m_intervals=args.m_intervals,
+            weight_bit=args.weight_bit,
+            act_bit=args.act_bit,
         )
     vae = TripoSGVAEModel.from_pretrained(
         partcrafter_weights_dir,
         subfolder="vae",
         torch_dtype=weight_dtype,
         quant_method=args.quant_method,
+        weight_bit=args.weight_bit,
         act_bit=args.act_bit,
     )
     
     if args.quant_method == 'qdit':
         if args.wbits < 16 or args.abits < 16:
+            from src.utils.qdit_utils import apply_qdit_to_model
             print("Applying Q-DiT Post-Training Quantization...")
             
             # Pre-process group sizes as Q-DiT expects them in list form
@@ -740,8 +750,28 @@ def main():
             # Call your newly created function
             device = accelerator.device
             transformer = apply_qdit_to_model(transformer, args, device=device)
-            
+    
+    if args.quant_method == 'point4bit':
+        from src.utils.point4bit import Point4BitLinear
+        masks = torch.load(args.masks_path) if args.masks_path else {}
         
+        def replace_linear_with_point4bit(module, masks, layer_name_prefix=""):
+            for name, child in module.named_children():
+                full_name = f"{layer_name_prefix}.{name}" if layer_name_prefix else name
+                if isinstance(child, torch.nn.Linear):
+                    point4bit_layer = Point4BitLinear(
+                        child.in_features, child.out_features, fg_ratio=args.m1_fg_ratio, weight_ratio=args.m2_weight_ratio, high_bits=4, low_bits=4, bias=child.bias is not None, masks=masks.get(full_name)
+                    )
+                    point4bit_layer.weight.data = child.weight.data.clone()
+                    if child.bias is not None:
+                        point4bit_layer.bias.data = child.bias.data.clone()
+                    setattr(module, name, point4bit_layer)
+                    print(f"Replaced {full_name} with Point4BitLinear")
+                else:
+                    replace_linear_with_point4bit(child, masks, full_name)
+        
+        replace_linear_with_point4bit(transformer, masks)
+    
     # pipeline = PartCrafterPipeline.from_pretrained(partcrafter_weights_dir, torch_dtype=weight_dtype)
     pipeline = PartCrafterPipeline.from_pretrained(
         partcrafter_weights_dir, 
@@ -753,7 +783,38 @@ def main():
     )
     # pipeline.to(accelerator.device, weight_dtype)
     if quantization_config is None:
-        pipeline.to(accelerator.device, weight_dtype)
+        # Check if pipeline has meta tensors and move components individually if needed
+        try:
+            pipeline.to(accelerator.device, weight_dtype)
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                print("Moving pipeline components from meta device individually...")
+                # Move specific components that might have meta tensors
+                try:
+                    pipeline.transformer.to(accelerator.device, weight_dtype)
+                except NotImplementedError:
+                    pipeline.transformer.to_empty(device=accelerator.device)
+                    # Convert dtype after moving
+                    pipeline.transformer.to(dtype=weight_dtype)
+                
+                try:
+                    pipeline.vae.to(accelerator.device, weight_dtype)
+                except NotImplementedError:
+                    pipeline.vae.to_empty(device=accelerator.device)
+                    pipeline.vae.to(dtype=weight_dtype)
+                
+                # Move other components - only try attributes that are likely modules
+                component_names = ['text_encoder', 'tokenizer', 'scheduler', 'feature_extractor', 'safety_checker', 'image_encoder']
+                for attr_name in component_names:
+                    if hasattr(pipeline, attr_name):
+                        attr = getattr(pipeline, attr_name)
+                        if hasattr(attr, 'to'):
+                            try:
+                                attr.to(accelerator.device, weight_dtype)
+                            except (NotImplementedError, AttributeError):
+                                pass  # Skip if can't move or not a module
+            else:
+                raise e
     pipeline.set_progress_bar_config(disable=True)
 
     set_seed(args.seed)

@@ -50,41 +50,6 @@ def aggregate_series(
     return values
 
 
-# def assign_bitwidth_schedule(
-#     avg_diffs: List[float],
-#     avg_curvatures: List[float],
-#     num_timesteps: int,
-#     diff_threshold: float,
-#     curvature_threshold: float,
-#     trigger_metric: str = "token_diff",
-#     valley_start: int = 20,
-#     valley_end: int = 30,
-# ) -> Tuple[List[int], List[int]]:
-#     w_bits, a_bits = [], []
-#     for step in range(num_timesteps):
-#         if step < valley_start:
-#             w_bits.append(8)
-#             a_bits.append(8)
-#             continue
-#         if valley_start <= step <= valley_end:
-#             diff_val = avg_diffs[step]
-#             curvature_val = avg_curvatures[step]
-#             if diff_val < diff_threshold:
-#                 if curvature_val >= curvature_threshold:
-#                     w_bits.append(16)
-#                     a_bits.append(4)
-#                 else:
-#                     w_bits.append(4)
-#                     a_bits.append(16)
-#             else:
-#                 w_bits.append(8)
-#                 a_bits.append(8)
-#             continue
-#         w_bits.append(4)
-#         a_bits.append(8)
-#     return w_bits, a_bits
-# src/utils/metrics_csv_utils.py
-
 def assign_bitwidth_schedule(
     avg_diffs: List[float],
     avg_curvatures: List[float],
@@ -101,34 +66,69 @@ def assign_bitwidth_schedule(
             w_bits.append(8)
             a_bits.append(8)
             continue
-            
         if valley_start <= step <= valley_end:
-            # Determine high/low precision based on the selected trigger_metric
-            if trigger_metric == "token_diff":
-                # is_low_precision = avg_diffs[step] < diff_threshold
-                w_bits.append(4)
-                a_bits.append(4)
-            elif trigger_metric == "curvature":
-                pass
-                # is_low_precision = avg_curvatures[step] < curvature_threshold
-            # else:
-            #     is_low_precision = False
-
-            # if is_low_precision:
-            #     # Assign lower precision when the trigger metric is below threshold
-            #     print(f"Step {step}: {trigger_metric} is low, assigning low precision (4-bit)")
-            #     w_bits.append(4)
-            #     a_bits.append(4)
-            # else:
-            #     # Assign higher precision (16-bit) if metric is high/spiking
-            #     w_bits.append(16)
-            #     a_bits.append(16)
+            diff_val = avg_diffs[step]
+            curvature_val = avg_curvatures[step]
+            if diff_val < diff_threshold:
+                if curvature_val >= curvature_threshold:
+                    w_bits.append(16)
+                    a_bits.append(4)
+                else:
+                    w_bits.append(4)
+                    a_bits.append(16)
+            else:
+                w_bits.append(8)
+                a_bits.append(8)
             continue
-            
-        # Default behavior after timestep 30
         w_bits.append(4)
         a_bits.append(8)
     return w_bits, a_bits
+# src/utils/metrics_csv_utils.py
+
+# def assign_bitwidth_schedule(
+#     avg_diffs: List[float],
+#     avg_curvatures: List[float],
+#     num_timesteps: int,
+#     diff_threshold: float,
+#     curvature_threshold: float,
+#     trigger_metric: str = "token_diff",
+#     valley_start: int = 20,
+#     valley_end: int = 30,
+# ) -> Tuple[List[int], List[int]]:
+#     w_bits, a_bits = [], []
+#     for step in range(num_timesteps):
+#         if step < valley_start:
+#             w_bits.append(8)
+#             a_bits.append(8)
+#             continue
+            
+#         if valley_start <= step <= valley_end:
+#             # Determine high/low precision based on the selected trigger_metric
+#             if trigger_metric == "token_diff":
+#                 # is_low_precision = avg_diffs[step] < diff_threshold
+#                 w_bits.append(4)
+#                 a_bits.append(4)
+#             elif trigger_metric == "curvature":
+#                 pass
+#                 # is_low_precision = avg_curvatures[step] < curvature_threshold
+#             # else:
+#             #     is_low_precision = False
+
+#             # if is_low_precision:
+#             #     # Assign lower precision when the trigger metric is below threshold
+#             #     print(f"Step {step}: {trigger_metric} is low, assigning low precision (4-bit)")
+#             #     w_bits.append(4)
+#             #     a_bits.append(4)
+#             # else:
+#             #     # Assign higher precision (16-bit) if metric is high/spiking
+#             #     w_bits.append(16)
+#             #     a_bits.append(16)
+#             continue
+            
+#         # Default behavior after timestep 30
+#         w_bits.append(4)
+#         a_bits.append(8)
+#     return w_bits, a_bits
 
 
 def compute_bops_from_schedule(

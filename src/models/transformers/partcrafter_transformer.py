@@ -385,9 +385,16 @@ class DiTBlock(nn.Module):
         compute_entropy = attention_kwargs.get("compute_entropy", False)
         entropy_list = attention_kwargs.get("entropy_list")
         attn_num_parts = attention_kwargs.get("num_parts")
+        profile_times = attention_kwargs.get("profile_times")
+        layer_idx = attention_kwargs.get("layer_idx", -1)
 
         if temb is not None and temb.dim() == 3:
-            temb = temb.squeeze(1)
+            temb = temb.squeeze(1).clone()
+
+        # Profiling variables
+        attn1_time = 0.0
+        attn2_time = 0.0
+        ff_time = 0.0
 
         # Notice that normalization is always applied before the real computation in the following blocks.
         # 0. Long Skip Connection
@@ -409,6 +416,21 @@ class DiTBlock(nn.Module):
             else:
                 cat = self.skip_norm(cat)
                 hidden_states = self.skip_linear(cat)
+        
+        w_bits = attention_kwargs.get("w_bits", 16) if attention_kwargs else 16
+        a_bits = attention_kwargs.get("a_bits", 16) if attention_kwargs else 16
+
+        # Helper function for simulated quantization
+        def apply_quant(t, bits):
+           
+            if bits >= 16: return t
+            
+            q_min, q_max = -(2**(bits - 1)), 2**(bits - 1) - 1
+            scale = t.abs().max() / q_max
+            return torch.clamp(torch.round(t / (scale + 1e-8)), q_min, q_max) * scale
+        
+        
+        hidden_states = apply_quant(hidden_states, a_bits)
 
         # 1. Self-Attention
         if self.use_self_attention:
@@ -416,6 +438,11 @@ class DiTBlock(nn.Module):
                 norm_hidden_states = self.norm1(hidden_states, temb)
             else:
                 norm_hidden_states = self.norm1(hidden_states)
+            if profile_times is not None:
+                import time
+                start_time = time.time()
+                
+            norm_hidden_states = apply_quant(norm_hidden_states, a_bits)
             attn_output = self.attn1(
                 norm_hidden_states,
                 image_rotary_emb=image_rotary_emb,
@@ -423,6 +450,8 @@ class DiTBlock(nn.Module):
                 compute_entropy=compute_entropy,
                 entropy_list=entropy_list,
             )
+            if profile_times is not None:
+                attn1_time = time.time() - start_time
             hidden_states = hidden_states + attn_output
 
         if torch.isnan(hidden_states).any():
@@ -435,6 +464,9 @@ class DiTBlock(nn.Module):
                 norm_hidden_states = self.norm2(hidden_states, temb)
             else:
                 norm_hidden_states = self.norm2(hidden_states)
+            if profile_times is not None:
+                import time
+                start_time = time.time()
             hidden_states = hidden_states + self.attn2(
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -455,6 +487,8 @@ class DiTBlock(nn.Module):
                     compute_entropy=compute_entropy,
                     entropy_list=entropy_list,
                 )
+            if profile_times is not None:
+                attn2_time = time.time() - start_time
             # if self.editing == "source_cross_attn":
             #     hidden_states = hidden_states + self.attn_edit(
             #         self.norm_edit(hidden_states),
@@ -475,10 +509,26 @@ class DiTBlock(nn.Module):
             mlp_inputs = self.norm3(hidden_states, temb)
         else:
             mlp_inputs = self.norm3(hidden_states)
+            
+        mlp_inputs = apply_quant(mlp_inputs, a_bits)
+        if profile_times is not None:
+            import time
+            start_time = time.time()
         hidden_states = hidden_states + self.ff(mlp_inputs)
+        if profile_times is not None:
+            ff_time = time.time() - start_time
         
         if torch.isnan(hidden_states).any():
             raise ValueError("NaN value detected in hidden_states after feed-forward in DiTBlock.")
+
+        # Record profiling times
+        if profile_times is not None:
+            profile_times.append({
+                'layer_idx': layer_idx,
+                'attn1_time': attn1_time,
+                'attn2_time': attn2_time,
+                'ff_time': ff_time
+            })
 
         return hidden_states
     
@@ -634,7 +684,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         activation_fn="gelu",
                         norm_type="fp32_layer_norm",  # TODO
                         norm_eps=1e-5,
-                        conditioning_embedding_dim=self.inner_dim,
+                        conditioning_embedding_dim=None,
                         ff_inner_dim=int(self.inner_dim * self.mlp_ratio),
                         skip=layer > num_layers // 2,
                         skip_concat_front=True,
@@ -735,6 +785,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     ):
         # TODO: implement gradient checkpointing
         self.gradient_checkpointing = enable
+        
 
     def _set_time_proj(
         self,
@@ -917,6 +968,9 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             lora_scale = attention_kwargs.pop("scale", 1.0)
         else:
             lora_scale = 1.0
+            
+        w_bits = attention_kwargs.get("w_bits", 16) if attention_kwargs else 16
+        a_bits = attention_kwargs.get("a_bits", 16) if attention_kwargs else 16
 
         if USE_PEFT_BACKEND:
             # weight the lora layers by setting `lora_scale` for each PEFT layer
@@ -1014,6 +1068,14 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         else:
             timestep_val = int(timestep)
 
+        # Clear DeepCache for new timestep
+        if helper:
+            helper.clear_cache_for_new_timestep(timestep_val)
+
+        # Profiling setup
+        profile_times = attention_kwargs.get("profile_times") if attention_kwargs else None
+        cache_times = attention_kwargs.get("cache_times") if attention_kwargs else None
+
         skips = []
         layer_idx = 0
         while layer_idx < len(self.blocks):
@@ -1047,30 +1109,38 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             
             input_attention_kwargs = None
             if len(self.global_attn_block_ids) == 0:
-                input_attention_kwargs = attention_kwargs
+                input_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
             elif layer_idx in self.global_attn_block_ids:
                 # Inject control signal into global attention block
-                input_attention_kwargs = attention_kwargs
+                input_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
             else:
                 if attention_kwargs is not None:
-                    allowed_keys = ["compute_entropy", "entropy_list", "num_parts"]
+                    allowed_keys = ["compute_entropy", "entropy_list", "num_parts", "profile_times"]
                     input_attention_kwargs = {k: v for k, v in attention_kwargs.items() if k in allowed_keys}
                 else:
-                    input_attention_kwargs = None
+                    input_attention_kwargs = {}
+            
+            # Add layer_idx for profiling
+            input_attention_kwargs['layer_idx'] = layer_idx
+            input_attention_kwargs['w_bits'] = w_bits
+            input_attention_kwargs['a_bits'] = a_bits
 
-            if helper and not helper.is_cache_step(timestep_val) and layer_idx == helper.skip_block_range[0]:
-                # Retrieval step (Delta-Cache): apply cached residual to current input and jump.
-                cache_key = layer_idx
-                cached_delta = helper.cache_dict.get(cache_key)
-                if cached_delta is not None:
-                    if cached_delta.shape != hidden_states.shape:
-                        print(f"Shape mismatch in DeepCache retrieval at layer {layer_idx}: cached_delta shape {cached_delta.shape} vs hidden_states shape {hidden_states.shape}")
-                    hidden_states = hidden_states + cached_delta
-                    # Ensure adaLN conditioning remains consistent for bypassed blocks.
-                    # Since norms in blocks use temb via adaLN, the conditioning is included in the cached delta.
-                    layer_idx = helper.skip_block_range[1]
+            if helper and helper.should_skip_layer(layer_idx, timestep_val):
+                # Skip this layer - retrieve cached output from earlier in this timestep
+                cache_key = helper.get_retrieval_key(layer_idx, timestep_val)
+                cached_output = helper.cache_dict.get(cache_key)
+                if cached_output is not None:
+                    if cache_times is not None:
+                        import time
+                        start_time = time.time()
+                    with torch.no_grad():
+                        hidden_states = cached_output.to(hidden_states.device, hidden_states.dtype)
+                    if cache_times is not None:
+                        cache_times.append(time.time() - start_time)
+                    # Handle skip connections for skipped layers
                     if layer_idx < self.config.num_layers // 2:
                         skips.append(hidden_states)
+                    layer_idx += 1
                     continue
 
             # Full inference or non-skipped block
@@ -1112,9 +1182,11 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     attention_kwargs=input_attention_kwargs,
                 )  # (N, T+1, D)
 
-            if helper and helper.is_cache_step(timestep_val) and current_layer_idx == helper.skip_block_range[0]:
-                # Store residual delta for future retrieval steps.
-                helper.cache_dict[current_layer_idx] = (hidden_states - block_input_hidden_states).clone()
+            # Cache outputs for potential reuse within this timestep
+            if helper and not helper.should_skip_layer(layer_idx, timestep_val):
+                # Cache the output of computed layers for potential reuse by later layers in this timestep
+                cache_key = helper.get_cache_key(layer_idx, timestep_val)
+                helper.cache_dict[cache_key] = hidden_states.detach()
 
             layer_idx += 1
             if layer_idx - 1 < self.config.num_layers // 2:
@@ -1133,6 +1205,7 @@ class PartCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
             print(f"Divergence detected at timestep {timestep_val}: NaN or Inf in output latent.")
+        
         if not return_dict:
             return (hidden_states,)
 

@@ -26,6 +26,9 @@ from src.utils.render_utils import (
 )
 from src.utils.data_utils import get_colored_mesh_composition
 
+# Import DeepCache helper
+from src.test_deepcache_partcrafter import DiTCacheHelper
+
 # Standard library
 import argparse
 import csv
@@ -295,10 +298,22 @@ def run_evaluation(
             if analyzer:
                 analyzer.reset_for_new_step(save_intermediate_dir)
 
+            # Setup DeepCache if enabled
+            attention_kwargs = {"num_parts": num_parts}
+            if args.deepcache:
+                deepcache_helper = DiTCacheHelper(
+                    cache_interval=args.cache_interval,
+                    cache_branch_id=args.cache_branch_id,
+                    num_timesteps=configs['test']['num_inference_steps']
+                )
+                deepcache_helper.clear_cache()
+                attention_kwargs["deepcache_helper"] = deepcache_helper
+
+            w_tmp = []
             with torch.no_grad():
                 output = pipeline(
                     [image_pil] * num_parts,
-                    attention_kwargs={"num_parts": num_parts},
+                    attention_kwargs=attention_kwargs,
                     num_tokens=configs['model']['vae']['num_tokens'],
                     generator=generator,
                     num_inference_steps=configs['test']['num_inference_steps'],
@@ -312,7 +327,7 @@ def run_evaluation(
                     save_intermediate_dir=save_intermediate_dir, 
                     collect_dynamics_stats=True,
                     configs=configs,
-                    analyzer=analyzer 
+                    analyzer=analyzer,
                 )
             
             if analyzer:
@@ -587,6 +602,11 @@ def main():
                     choices=["token_diff", "curvature"], 
                     help="Metric to trigger precision changes in the 20-30 window.")
     
+    # DeepCache arguments
+    parser.add_argument("--deepcache", action="store_true", help="Enable DeepCache acceleration")
+    parser.add_argument("--cache_interval", type=int, default=2, help="DeepCache cache interval")
+    parser.add_argument("--cache_branch_id", type=int, default=0, help="DeepCache cache branch ID")
+    
     args, extras = parser.parse_known_args()
     configs = get_configs(args.config, extras)
 
@@ -745,7 +765,38 @@ def main():
     )
     # pipeline.to(accelerator.device, weight_dtype)
     if quantization_config is None:
-        pipeline.to(accelerator.device, weight_dtype)
+        # Check if pipeline has meta tensors and move components individually if needed
+        try:
+            pipeline.to(accelerator.device, weight_dtype)
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                print("Moving pipeline components from meta device individually...")
+                # Move specific components that might have meta tensors
+                try:
+                    pipeline.transformer.to(accelerator.device, weight_dtype)
+                except NotImplementedError:
+                    pipeline.transformer.to_empty(device=accelerator.device)
+                    # Convert dtype after moving
+                    pipeline.transformer.to(dtype=weight_dtype)
+                
+                try:
+                    pipeline.vae.to(accelerator.device, weight_dtype)
+                except NotImplementedError:
+                    pipeline.vae.to_empty(device=accelerator.device)
+                    pipeline.vae.to(dtype=weight_dtype)
+                
+                # Move other components - only try attributes that are likely modules
+                component_names = ['text_encoder', 'tokenizer', 'scheduler', 'feature_extractor', 'safety_checker', 'image_encoder']
+                for attr_name in component_names:
+                    if hasattr(pipeline, attr_name):
+                        attr = getattr(pipeline, attr_name)
+                        if hasattr(attr, 'to'):
+                            try:
+                                attr.to(accelerator.device, weight_dtype)
+                            except (NotImplementedError, AttributeError):
+                                pass  # Skip if can't move or not a module
+            else:
+                raise e
     pipeline.set_progress_bar_config(disable=True)
 
     set_seed(args.seed)

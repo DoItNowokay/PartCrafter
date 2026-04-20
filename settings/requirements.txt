@@ -20,3 +20,5 @@ wandb[media]
 colormaps
 psutil
 GPUtil
+DeepCache
+scipy

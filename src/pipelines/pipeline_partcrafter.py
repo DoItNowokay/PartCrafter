@@ -248,6 +248,8 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
         collect_dynamics_stats: bool = False,
         configs: Optional[Dict] = None,
         analyzer: Optional[Any] = None,
+        w_bits_schedule: Optional[List[int]] = None,
+        a_bits_schedule: Optional[List[int]] = None,
     ):
         # 1. Define call parameters
         self._guidance_scale = guidance_scale
@@ -357,6 +359,9 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+                
+                current_w_bits = w_bits_schedule[i] if w_bits_schedule is not None else 16
+                current_a_bits = a_bits_schedule[i] if a_bits_schedule is not None else 16
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
@@ -386,6 +391,13 @@ class PartCrafterPipeline(DiffusionPipeline, TransformerDiffusionMixin):
                     attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
                     attention_kwargs['compute_entropy'] = True
                     attention_kwargs['entropy_list'] = entropy_list
+                    
+                
+                attention_kwargs.update({
+                    "w_bits": current_w_bits,
+                    "a_bits": current_a_bits
+                })
+
 
                 noise_pred = self.transformer(
                     latent_model_input,
